@@ -1,5 +1,573 @@
-# FluxGram Server
+<p align="center">
+  <img src="media/readme/fluxgram_splash.png" alt="FluxGram" width="440">
+</p>
 
-Self-hosted messaging platform server.
+# 🚀 FluxGram Server
 
-> Initial repository setup. The source-code migration from OwpenGram has not yet been completed.
+**Your own private messaging server — self-hosted, protocol-compatible, fully yours.**
+
+The protocol stack is built on the published
+[`github.com/fluxgram/fluxgram-td`](https://github.com/fluxgram/fluxgram-td) module
+(`v1.7.0`), using a canonical Layer 232 schema with sparse `tlprofile`
+exact Layer 225-232 compatibility profiles.
+
+If you are looking for a **Telegram server**, **MTProto server**,
+**Telegram backend**, **Telegram clone server**, or **self-hosted
+Telegram-like chat server**, this repository is the server-side implementation
+to study, run, and improve.
+
+FluxGram Server is an open-source, Telegram-compatible MTProto backend written
+in Go. Run it on your own network for a private, closed setup, or on a VPS to
+be reachable anywhere in the world. Your data, your keys, your rules — no
+cloud, no lock-in, no censorship.
+
+> 🔗 Implements **MTProto API layers 225-232** — a client is admitted on the
+> exact layer it announces, so older builds keep working after the server moves
+> forward. The running server reports its version, the layers it accepts, and
+> its build in the admin panel sidebar.
+
+`FluxGram Server` is independent and unofficial. It is not affiliated with, endorsed by,
+or sponsored by Telegram or the official Telegram team.
+
+---
+
+## ✨ Why FluxGram?
+
+- 🔒 **Private & self-hosted** — messages live on infrastructure you control.
+- 🧩 **Telegram-compatible** — works with the FluxGram Android and Desktop clients.
+- 🌍 **Reachable anywhere** — host it globally, or keep it on your own network.
+- 🛡️ **Censorship-resistant** — no central authority can shut you down.
+- ⚙️ **Single binary** — one Go program prepares keys, runs migrations, serves
+  MTProto, and dispatches updates and background workers.
+- 📦 **One command to install** — the launcher builds and runs the server
+  (Go is the only thing you install yourself), brings the stack up, and
+  hands you a browser setup wizard.
+- 🆓 **Free & open source** — Apache-2.0, audit and extend it freely.
+
+## 🎯 What works today
+
+- 💬 Private chats, groups, supergroups & channels
+- 📞 Voice & group calls, live streams, SFU/TURN building blocks
+- 🖼️ Media & files — photos, videos, documents, stickers, reactions
+- 💾 Media storage on local disk **or** an S3/MinIO-compatible object store
+- 🤖 Bots and mini apps, with a minimal Bot API gateway
+- 🏷️ Fragment-style NFT/collectible usernames and bot verification marks
+- 📢 Admin-panel broadcasts — announce to every user, or a picked list
+- 🔑 Self-hosted "Log in with Telegram" (OpenID Connect) and passkey sign-in
+- 🌐 Message translation and AI-assisted compose
+- 📇 Contacts, dialogs sync, chat folders, public link landing pages
+- 🔎 **Self-configuring clients** — "Add Server" needs only `host:port`; the
+  server publishes its DC id, RSA key and identity over a well-known HTTP path
+- 👥 **Multi-operator admin panel** — named operator accounts with scoped
+  permissions, instead of one shared password
+- 🗄️ **Storage management** — usage breakdown, retention rules, and guarded
+  purge of orphaned or expired media
+- 👋 Welcome messages and login-code templates you can edit from the panel
+- 🧙 **First-run web setup wizard** — server identity, public address, Bot API
+  and your operator account, then a restart, all from the browser
+- 🖥️ Admin API and web UI for operations, run by one foreground `fluxgram-ctl`
+
+<details>
+<summary><b>📋 Full feature checklist (click to expand)</b></summary>
+
+| Status | Feature | What works today |
+|---|---|---|
+| ✅ | MTProto server edge | TCP transport, RSA key exchange, auth keys, encrypted sessions, salts, ack/resend, bad messages, RPC dispatch, canonical Layer 232, sparse exact Layer 225-232 compatibility profiles, and a same-port HTTP side that serves WebSocket transport plus the `/fluxgram/server-info` and `/fluxgram/server-icon` self-configuration endpoints. |
+| ✅ | Login and accounts | Development login code, configurable external code delivery (SMS webhook or SMTP), login email as a second factor, email-as-identity sign-up (no phone number needed), sign-in, sign-up, log-out, authorizations, account settings, SRP/password state, WebAuthn passkey sign-in, and a self-hosted Telegram Login (OpenID Connect) provider for third-party sites. |
+| ✅ | Users and contacts | User profiles, usernames, profile photos, contact import/search, blocked/privacy state, presence, and last-seen style status. |
+| ✅ | Dialogs and sync | Dialog list, pinned dialogs, manual unread, folders/filters, drafts, read boundaries, durable updates, online fan-out, and offline difference recovery. |
+| ✅ | Chatlists and public links | Chat folder sharing, exported chatlist invite links, join/import flows, revoked invite handling, public username landing pages, and shared public link landing pages. |
+| ✅ | Private chats | Send, history, read receipts, edit, delete, forward, reply, rich entities, grouped/media messages, reactions, scheduled/TTL-oriented paths. |
+| ✅ | Rich messages | Telegram Desktop rich text messages, rich content conversion, send/edit/scheduled flows, dialog/history projections, and memory/PostgreSQL persistence. |
+| ✅ | AI compose and ChatBot | Input-box rewrite/polish, default and custom tones, addstyle previews, local and external provider chains, streamed `@ChatBot` draft replies, and Business AI reply hooks. |
+| ✅ | Message translation | Telegram `messages.translateText`, provider-backed batch translation, peer language settings, per-account rate limits, and privacy-conscious logging defaults. |
+| ✅ | Supergroups and channels | Create, join, leave, invite links, participants, admins, forum topics, linked discussion guests, history, send/edit/delete/read, reactions, public search, and previews. |
+| ✅ | Media and files | Upload, download, local-disk **or** S3/MinIO-compatible object storage (switchable per deployment, existing files stay reachable after a switch), low-space upload guard, automatic stale-media cleanup, photos, documents, thumbnails, canonical GIFv conversion, external media fetch, web page previews, map tile cache hooks, profile/channel photos. |
+| ✅ | Stickers, reactions, and GIFs | Sticker/reaction catalog, seed support, recent/top/default reactions, moderation-oriented reaction paths, and an admin-curated `@gif` inline catalog (categorized, auto-save-to-Saved-GIFs on send, category-icon filtering in the client's GIF picker) served alongside the client's Saved GIFs. |
+| ✅ | Collectible usernames and verification | Fragment-style NFT/collectible usernames (mint, transfer, activate/deactivate), the official platform-checkmark flow (`@verifybot`), and a third-party bot-verification mark mechanism (`@marksbot`, icon + description before a name) — the latter is experimental and hidden by default. |
+| ✅ | Bots and mini apps | Bot service foundations, callbacks, inline helpers, webview/mini-app paths, a minimal Bot API gateway for libraries such as `python-telegram-bot`, persistent `getUpdates` delivery, and demo tools. |
+| ✅ | Calls and live streams | Private call signaling foundations, group call state, RTMP live streaming, scheduled video chats, channel `join_as`, SFU/TURN building blocks, liveness, and expiry workers. |
+| ✅ | Admin and operations | Admin API/UI backend, a first-run web setup wizard (server identity, public network fields, optional Bot API gateway, first operator account), named operator accounts with per-section permissions and a wildcard "full access" grant, per-account freeze (admin-set read-only restriction, advertised to the client via appConfig), broadcast messaging (announce from the official account to every user or a picked list), editable welcome and login-code message templates, storage management (usage breakdown, retention rules, guarded purge), shared-device detection across accounts, RBAC-scoped admin API tokens, PostgreSQL migrations, in-process volatile state, retention workers, pprof/debug hooks, load-test helpers, one-click update with a dry run before it applies. |
+| ✅ | Desktop, Android, iOS, and Web focus | Telegram Desktop is the primary target, with Android, iOS, and Web compatibility paths actively covered by the same server. |
+
+Some items are compatibility-first or experimental, but they are real open
+server code, not hidden product-only features.
+</details>
+
+## 🚀 Want to see it first?
+
+You do not have to run a server to try FluxGram. We keep a **public server
+live**, and it ships inside both clients as a ready-made entry — install a
+client, pick **FluxGram** on the server-selection screen, sign in. Nothing to
+configure.
+
+Come back here when you want that server to be yours.
+
+## ⚡ Quick Start
+
+**1. Clone the repository**
+
+```bash
+git clone https://github.com/fluxgram/fluxgram-server.git
+cd fluxgram-server
+```
+
+**2. Run the launcher**
+
+```bash
+./fluxgram-server.sh     # Linux
+```
+```powershell
+.\fluxgram-server.bat    # Windows
+```
+
+The launcher checks for the one thing it truly needs — **Go 1.25+** — and
+points you at https://go.dev/dl/ if it's missing; install it yourself and
+re-run the launcher. Nothing else has to be installed: no Docker, no database.
+
+**3. Open the admin panel**
+
+The launcher builds and runs `fluxgram-ctl` (`cmd/fluxgram-ctl`, plain Go). It
+stays in the foreground and runs the server and its admin panel for as long
+as it runs — **Ctrl+C (or closing the window) stops both**. On a fresh clone
+it writes `.env` from `.env.example`, generating the admin API token, session
+key and an admin password, and prints the admin panel address and that
+password. The server itself does not start yet: it waits for the first-run
+setup below.
+
+**4. Finish setup in the browser**
+
+Open that address. On a fresh install the panel opens a **web setup wizard**.
+Its first step is where the server keeps its data:
+
+- **Database** — the **built-in PostgreSQL** (the default; nothing to
+  install, `fluxgram-ctl` runs it next to the server and stops it with the
+  server), or **your own PostgreSQL**, given as a connection string.
+- **Media** (photos, files, stickers) — **local disk** (a folder) or
+  **S3-compatible storage** (AWS S3, MinIO, …: endpoint, bucket, keys).
+
+> **Windows only — built-in PostgreSQL.** On Windows the built-in PostgreSQL is
+> a native MSVC build, so the machine needs the **Microsoft Visual C++
+> Redistributable (2015–2022, x64)**: install `vc_redist.x64.exe` from
+> https://aka.ms/vs/17/release/vc_redist.x64.exe . Without it the server logs the
+> PostgreSQL start failing with `exit status 0xc0000135` (a missing DLL). This
+> applies only to the built-in/local PostgreSQL; using your own PostgreSQL — or
+> running on Linux/macOS — needs nothing extra.
+
+What you enter is checked before it is saved — the database must answer, the
+folder must be writable, the bucket must exist. Then the server starts, and
+the wizard continues with the server name, description and icon, the public
+address clients will connect to, the optional Bot API gateway and your own
+operator account. Nothing has to be hand-edited to get going.
+
+From then on everything is done in the admin panel: restarting the server,
+checking for updates, editing settings. (`fluxgram-ctl status`, `stop`,
+`restart`, `update` and `logs` exist too, from another terminal.)
+
+**Running PostgreSQL or MinIO in Docker?** The server never starts Docker.
+If you prefer containers, start them yourself —
+[`deploy/docker-compose.yml`](deploy/docker-compose.yml) is an example
+(`docker compose -f deploy/docker-compose.yml up -d`) — and pick "your own
+PostgreSQL" / S3 in the wizard. They must be running before the server is.
+
+**Upgrading an install from before this change?** Nothing to do for most
+setups: an `.env` that already names a PostgreSQL (`TELESRV_POSTGRES_DSN`) or
+S3 endpoint keeps using exactly those, and an old `TELESRV_EDITION=portable`
+keeps using its built-in database. What changed is that `fluxgram-ctl` no
+longer starts the Docker containers: if yours were started by it, run
+`docker compose -f deploy/docker-compose.yml up -d` once (they restart with
+Docker after that) — see the note about volume names at the top of that file.
+
+<details>
+<summary><b>🔧 Prefer to do it manually? (click to expand)</b></summary>
+
+Requirements: **Go 1.25+**.
+
+**Build and run the server**
+
+Windows (PowerShell):
+
+```powershell
+go build -o bin/fluxgram-server.exe ./cmd/telesrv
+.\bin\fluxgram-server.exe
+```
+
+Linux / macOS:
+
+```bash
+go build -o bin/fluxgram-server ./cmd/telesrv
+./bin/fluxgram-server
+```
+
+Run this way nothing starts the built-in PostgreSQL for you — set
+`TELESRV_POSTGRES_MODE=external` and `TELESRV_POSTGRES_DSN` in `.env` and
+start that PostgreSQL yourself.
+
+On first start, the server creates `data/server_rsa.pem`, applies database
+migrations, seeds bundled language packs, prepares optional media resources,
+starts MTProto on `0.0.0.0:2398`, and brings up the update/media/background
+workers in the same process.
+
+> **Default local login code:** `12345` — change it before any real use!
+
+Without the web wizard you also have to fill in `.env` yourself; see
+"⚙️ Configuration" below and [`.env.example`](.env.example).
+
+</details>
+
+### 🏷️ Version and build
+
+The admin panel's sidebar footer identifies exactly what is running:
+
+```text
+Version: O9
+API layers: 225-232
+Build: 7ad68c3
+```
+
+- **Version** — the FluxGram server release line (`O9`).
+- **API layers** — every MTProto TL schema layer this binary can talk, read
+  straight from the compatibility profiles rather than hardcoded.
+- **Build** — the short commit the binary was built from, stamped
+  automatically by Go's VCS info (no special build flags needed); a trailing
+  `+` means it was built from a working tree with uncommitted changes. Hover
+  it for the full hash.
+
+Quote the `Version` / `Build` pair in bug reports — it pins the exact code,
+which a release tag alone does not.
+
+### 👥 Operators and permissions
+
+The panel is no longer one shared password. Its **Operators** page creates
+named accounts, each with its own login and an explicit set of permissions,
+granted per section and per level — for example `accounts.read`
+vs `accounts.manage`, `storage.read` vs `storage.manage`, `broadcasts.send`,
+`moderation.review`, `server.manage`, `admins.manage`. An operator only sees
+the sections they hold a permission for; reaching anything else lands on a
+clear 403 screen instead of an empty page.
+
+A **Full access** checkbox at the top of the permission grid grants the `*`
+wildcard — everything, including permissions added by future releases. It is
+deliberately separate from the grid (which is disabled while it is on), so
+"this person is a full admin" and "this person may do these six things" never
+get confused.
+
+The one thing the panel will not let you do is lock yourself out: removing
+`admins.manage` from the last enabled operator who holds it — by editing,
+disabling, or deleting them — is refused, whether the grant is explicit or via
+the wildcard. There is always someone left who can manage operators.
+
+Your first operator is created by the web setup wizard. Before it exists, the
+panel lets you in with a password it generates for that one purpose — and stops
+accepting that generated password the moment the wizard finishes. A password you
+set yourself (in Server Settings, or `TELESRV_ADMIN_UI_PASSWORD` in `.env`)
+keeps working as a full-access break-glass login alongside the operator
+accounts, so leave it unset or treat it like a root password.
+
+### ⚙️ Configuration
+
+[`.env.example`](.env.example) is the complete configuration reference — every
+variable is documented there with an explanatory comment, grouped by feature.
+Copy it to `.env` and edit, or set the variables directly as environment
+variables. Most commonly used variables:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `TELESRV_LISTEN` | `0.0.0.0:2398` | MTProto listen address |
+| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | client-reachable fallback IP for media and calls |
+| `TELESRV_DC` | `2` | self-hosted DC id |
+| `TELESRV_DEV_AUTH_CODE` | `12345` | fixed login code for local development |
+| `TELESRV_AUTH_CODE_MAX_ATTEMPTS` | `5` | wrong-code attempts before the code hash is deleted |
+| `TELESRV_POSTGRES_DSN` | local Compose DSN | PostgreSQL connection string |
+| `TELESRV_BLOB_DIR` | `data/blobs` | local media blob directory |
+| `TELESRV_PUBLIC_LINK_WEB_ADDR` | empty | optional public link landing listener, for example `127.0.0.1:2401` |
+| `TELESRV_BOT_API_ADDR` | empty | optional HTTP Bot API gateway listen address, for example `127.0.0.1:8081` |
+| `TELESRV_AI_ENABLED` | `true` | enable AI compose entry points |
+| `TELESRV_TRANSLATION_ENABLED` | `true` | enable Telegram message translation RPCs |
+
+Optional OpenAI-compatible, Kimi/Moonshot, Gemini, and Anthropic AI provider
+variables, login email/SMTP settings, and Business AI settings are documented
+in `.env.example`.
+
+### ✉️ Login codes, email login, and email sign-up
+
+By default the server just uses a fixed development code
+(`TELESRV_DEV_AUTH_CODE`, `12345`) for everything and writes it as a durable
+777000 message on the account. Three optional, independent features build on
+top of that:
+
+**1. External code delivery providers** — send the real login/phone-change
+code out via SMS webhook or SMTP instead of only the fixed dev code. An
+existing account's durable 777000 message is always written first; the
+provider is an *additional* delivery channel, never a replacement.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `TELESRV_PHONE_CODE_DELIVERY_PROVIDER` | `development` | `development` keeps the fixed code; `webhook` generates a random code and posts it to your own SMS webhook (protocol in `TELESRV_OTP_WEBHOOK_URL`/`_SECRET`/`_TIMEOUT`) |
+| `TELESRV_EMAIL_CODE_DELIVERY_PROVIDER` | `smtp` | `smtp` sends via `TELESRV_SMTP_*`; `webhook` reuses the same SMS webhook above |
+
+**2. Login email** — an extra verification factor on top of the phone number
+(not a replacement for it), similar to Telegram's own login-email feature.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `TELESRV_LOGIN_EMAIL_ENABLE` | `false` | turn the feature on |
+| `TELESRV_LOGIN_EMAIL_REQUIRE_SETUP` | `false` | force accounts without a login email to set one during the phone login flow |
+| `TELESRV_LOGIN_EMAIL_CODE_LENGTH` | `6` | length of the emailed code |
+| `TELESRV_SMTP_HOST` / `_PORT` / `_USERNAME` / `_PASSWORD` / `_FROM` / `_FROM_NAME` / `_TLS` / `_TIMEOUT` | — | outbound SMTP settings, required when the email provider is `smtp` |
+
+**3. Email-as-identity sign-up** — lets patched clients register and log in
+with just an email address, no phone number at all. The client encodes the
+email into a synthetic `888`-prefixed number and drives the ordinary
+`sendCode`/`signUp`/`signIn`/`changePhone` flow unchanged; the server decodes
+that number back to the email and delivers the code over the same channel as
+login email above (`TELESRV_EMAIL_CODE_DELIVERY_PROVIDER`). The account's
+real, visible phone number is a random-looking short number from
+`TELESRV_EMAIL_SIGNUP_PHONE_PREFIXES` — cosmetic only, never used to route the
+code — so admins can make freshly signed-up accounts look locally flavored
+(e.g. `888,380,373`) without any client update.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `TELESRV_EMAIL_SIGNUP_ENABLE` | `false` | turn the feature on (requires the email delivery channel above to be configured) |
+| `TELESRV_EMAIL_SIGNUP_PHONE_PREFIXES` | `888` | comma-separated prefixes for the account's cosmetic display number |
+
+### 💾 Media storage: local disk or S3/MinIO
+
+Uploaded media (photos, documents, stickers) can live on this machine's disk,
+or in an S3-compatible object store (AWS S3, or a self-hosted **MinIO** — the
+optional `deploy/docker-compose.yml` has one). It is chosen in the first-run
+wizard and can be changed later in Server Settings.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `TELESRV_BLOB_BACKEND` | `localfs` (`s3` when `TELESRV_S3_ENDPOINT` is set) | `s3` for MinIO/AWS S3, `localfs` to write to `TELESRV_BLOB_DIR` on disk |
+| `TELESRV_S3_ENDPOINT` | — | S3 API endpoint, `host[:port]` without `http://` (MinIO's default is `127.0.0.1:9000`) |
+| `TELESRV_S3_REGION` | `us-east-1` | S3 region |
+| `TELESRV_S3_BUCKET` | `fluxgram-media` | bucket name |
+| `TELESRV_S3_ACCESS_KEY_ID` / `TELESRV_S3_SECRET_ACCESS_KEY` | — | credentials (the example `docker-compose.yml` seeds MinIO with `fluxgram` / `fluxgram123`; change both before any real use) |
+| `TELESRV_S3_USE_SSL` | `false` | `true` for AWS S3 or a MinIO behind TLS; local MinIO runs plain HTTP |
+| `TELESRV_S3_PATH_STYLE` | `true` | required for MinIO (bucket in the URL path); leave `false` for AWS S3 |
+
+Switching backends only affects new uploads — existing files stay wherever
+they were written and remain reachable as long as that backend's settings
+stay filled in. The example compose file's MinIO also serves its web console at
+`http://localhost:9001`, with the same access key/secret.
+
+Related toggles (defaults in `.env.example`'s Advanced section): a low-space
+guard that rejects new uploads once storage nears full, and automatic
+cleanup of media no longer referenced by any message.
+
+**Storage management in the panel.** The admin panel's Storage page puts the
+rest of this behind a UI: a usage breakdown per media type, an upload size cap
+(`TELESRV_STORAGE_MAX_UPLOAD_FILE_BYTES`, validated against the protocol's own
+upload ceiling), retention rules that can expire media globally or per type
+(`TELESRV_STORAGE_RETENTION_MODE` and the `TELESRV_STORAGE_RETENTION_MAX_AGE*`
+family), and a "danger zone" for manual purges by media category and age.
+
+Destructive panel actions — purge, update, restart — all go through the same
+three-step flow: type a reason, run a **dry run** that reports exactly what
+would happen, then confirm. Nothing irreversible fires on a single click.
+
+## 🔌 Ports to open
+
+When deploying on a public server, open the following according to the
+features you enable.
+
+**Minimal (chat only)**
+
+| Port | Protocol | Purpose | Required |
+|---|---|---|---|
+| 2398 | TCP | MTProto main port; also handles WebSocket when `TELESRV_WEBSOCKET_ENABLE=true` | Yes |
+
+**With admin backend**
+
+| Port | Protocol | Purpose | Notes |
+|---|---|---|---|
+| 2399 | TCP | Admin REST API | Restrict to trusted IPs or put behind VPN |
+| 2600 | TCP | Admin Web UI | Use Nginx/reverse proxy + HTTPS in production |
+
+**Optional features**
+
+| Port | Protocol | Purpose | When needed |
+|---|---|---|---|
+| 2400 | TCP | RTMP live stream ingest | Live streaming |
+| 12399 | UDP | SFU/WebRTC conferencing | Voice/video group calls |
+| 12400 | UDP | TURN/STUN server | P2P/call relay |
+| 12500-12999 | UDP | TURN relay port range | TURN relay |
+| configurable | TCP | Bot API | When `TELESRV_BOT_API_ADDR` is set |
+| 2401 example | TCP | Public username/sticker/chatlist landing pages | When `TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401` is set |
+
+**Internal/debug (do not expose publicly)**
+
+| Port | Default bind | Purpose |
+|---|---|---|
+| 6060 | `127.0.0.1:6060` | pprof debugging endpoint |
+| 5432 | `127.0.0.1:5432` | PostgreSQL |
+| 9000 | `127.0.0.1:9000` | MinIO S3 API (only when `TELESRV_BLOB_BACKEND=s3` and self-hosting MinIO) |
+| 9001 | `127.0.0.1:9001` | MinIO web console |
+
+Make sure `TELESRV_LISTEN=0.0.0.0:2398` is set, and `TELESRV_ADVERTISE_IP`
+points to your public IP so clients can connect.
+
+## 🌐 Public link landing pages
+
+The server can serve public landing pages for `/<username>`, profile avatars,
+`/addstickers/<shortName>`, `/addemoji/<shortName>`, and `/addlist/<slug>`.
+
+```env
+TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401
+TELESRV_PUBLIC_BASE_URL=https://your-domain.example
+TELESRV_PUBLIC_APP_SCHEME=yourapp
+TELESRV_PUBLIC_WEB_BASE_URL=https://web.your-domain.example
+TELESRV_PUBLIC_APP_NAME=YourApp
+```
+
+In production, keep `TELESRV_PUBLIC_LINK_WEB_ADDR` on loopback and reverse-proxy
+the public routes to it with HTTPS.
+
+## 📱 Connect a client
+
+Use the FluxGram clients, which have a built-in **Add Server** option on the
+server-selection screen at login — no source patching or custom build needed.
+They also ship with our public server already in that list, so a client is
+useful the moment it is installed, with or without a server of your own.
+Both are forks of the official apps, kept on the same TL layer as the server and
+rebased on the upstream release that introduced it:
+
+| Client | Upstream base | Upstream commit | TL layer |
+|---|---|---|---|
+| 💻 [Desktop](https://github.com/fluxgram/fluxgram-desktop-client) | Telegram Desktop `v7.3.5` | `3a2a9a34e833d3243a13787215b8a7cdcf5dc3c3` | 232 |
+| 🤖 [Android](https://github.com/fluxgram/fluxgram-android-client) | Telegram for Android `v13.1.1` | `3de37c8cfb039452be7398909461da6288babf15` | 232 |
+
+A stock Telegram client will not connect, since it only trusts Telegram's own
+DC list and RSA keys. The server's canonical layer is 232, with exact
+compatibility profiles for layers 225-232 — so an older fork build keeps
+working after the server moves forward. Locally that server is
+`127.0.0.1:2398`, DC id `2`.
+
+**All you need is `host:port`.** On the login screen open server selection →
+**Add Server** and type the address (e.g. `chat.example.com:2398`, or
+`192.168.1.50:2398`). The client fetches `/fluxgram/server-info` from the same
+port and fills in the rest by itself — RSA public key, DC id, and the server's
+name, description and icon as you set them in the setup wizard. No
+`openssl`, no PEM copy-paste.
+
+The RSA key and DC id are still there under **Advanced** if you want to check
+or override them. To get the key by hand — for an air-gapped machine, or to
+verify what the client fetched — export it from the server's private key:
+
+```bash
+openssl rsa -in data/server_rsa.pem -RSAPublicKey_out -out data/server_rsa.pub
+```
+
+or just read the JSON the client reads:
+
+```bash
+curl http://your-server:2398/fluxgram/server-info
+```
+
+> Self-configuration rides the same-port HTTP side that also serves the
+> WebSocket transport, so it needs `TELESRV_WEBSOCKET_ENABLE=true` (the
+> default) and opens no extra port. With it off, fill in **Advanced** manually.
+
+## 🧪 Development: multi-device smoke test
+
+Use separate client working directories so sessions do not share local `tdata`:
+
+```powershell
+$tdesktop = "C:\path\to\tdesktop\out\Debug\Telegram.exe"
+Start-Process $tdesktop -ArgumentList @("-workdir", "$PWD\.tdata-alice")
+Start-Process $tdesktop -ArgumentList @("-workdir", "$PWD\.tdata-bob")
+```
+
+Log in with different phone numbers — the local login code is `12345` unless
+you changed `TELESRV_DEV_AUTH_CODE`. Recommended checks:
+
+- Send private messages, stickers, media, replies, forwards, edits, deletes,
+  and read receipts between two users.
+- Keep one device online and restart another device to verify offline
+  `updates.getDifference` recovery.
+- Open the same account from multiple sessions and confirm current-session
+  echoes are not duplicated while other online sessions receive updates.
+- Check server logs for no new `NOT_IMPLEMENTED`, `Unhandled RPC`, `bad_msg`,
+  panic, or internal errors.
+
+## 📂 Repository layout
+
+```text
+fluxgram-server.sh/.bat  one-command launcher (checks for Go, then builds+runs fluxgram-ctl)
+cmd/telesrv/              server entrypoint
+cmd/fluxgram-ctl/          the foreground supervisor: runs the server and the admin panel (and the built-in
+                          PostgreSQL) until stopped; also status/stop/restart/update/logs
+cmd/telesrv-admin/        admin backend and embedded React web UI (incl. the setup wizard)
+cmd/telesrv-update/       one-click update helper used by the panels
+deploy/                   migrations, deploy helpers, and an optional docker-compose (PostgreSQL + MinIO)
+data/                     bundled language packs and optional seed data
+internal/mtprotoedge/     MTProto transport, auth key, session, ack/resend, server-info endpoints
+internal/rpc/             TL router and client compatibility handlers
+internal/app/             domain services
+internal/domain/          protocol-independent domain models
+internal/store/           memory/postgres storage backends
+internal/embeddedpg/      the built-in PostgreSQL (TELESRV_POSTGRES_MODE=embedded), run by fluxgram-ctl
+internal/identity/        admin-editable server name, description, and icon
+internal/botapi/          minimal HTTP Bot API gateway
+internal/seed/            bundled seed catalog loaders
+internal/sfu/             real-time SFU experiments
+internal/turnsrv/         TURN/STUN building blocks
+```
+
+## 🎁 Star Gifts and gift packs
+
+A fresh server has **no gifts and no packs**. A gift pack is a `.zip` -- a
+`pack.json` manifest plus its Lottie/`.tgs` animations -- that an operator
+uploads in **StarGift Catalog → Import Pack**. Uploading only puts it on the
+shelf: you then preview every gift and every upgraded variant, and import
+either the whole pack or a single gift out of it.
+
+The server only imports and manages packs. The project's own two --
+**Grind Pack** (desk gear and coffee; also the reference pack, since between
+them its gifts exercise every Star Gift mechanic) and **Energy Pack** (one
+limited, craftable can with a large collectible flavour pool) -- are authored
+and exported by
+[fluxgram-giftpacks](https://github.com/fluxgram/fluxgram-giftpacks),
+which is where new art is made.
+**[docs/gift-packs.md](docs/gift-packs.md)** is the guide: a step-by-step
+build loop, the hard limits every animation must meet, the full `pack.json`
+reference, and the rlottie pitfalls that make an animation look perfect in a
+browser and render as nothing in a real client.
+
+## 🤝 Contributing
+
+This server gets better fastest with real usage and focused fixes:
+
+- Telegram Desktop and Android compatibility reports with reproducible steps.
+- RPC traces for startup, sync, chat, media, calls, bots, or edge cases.
+- Focused fixes for implemented paths instead of broad rewrites.
+- Tests for online/offline updates, multi-device sessions, read state, media,
+  and channel behavior.
+- Performance work on hot paths such as fan-out, pagination, storage queries,
+  media upload/download, and connection handling.
+
+If a change affects visible client behavior, please include the client
+version/commit, the RPC path you tested, and whether server logs stayed free
+of new `NOT_IMPLEMENTED`, `Unhandled RPC`, `bad_msg`, panic, or internal errors.
+
+## 💬 Community
+
+- 📢 Channel: [@fluxgram](https://t.me/fluxgram)
+- 💬 Chat: [Join the discussion](https://t.me/+sVB6Ymv70jEwNTAy)
+
+FluxGram Server is an independent project with its own codebase and its own
+MTProto library, [fluxgram-td](https://github.com/fluxgram/fluxgram-td)
+(built on [gotd/td](https://github.com/gotd/td)). It originally started from the
+open-source [gramsrv](https://github.com/iamxvbaba/gramsrv) project, which we
+thank for the foundation.
+
+## 📄 License
+
+[Apache License 2.0](LICENSE)
+
+---
+
+⭐ If FluxGram is useful to you, a star on GitHub helps the project grow.
