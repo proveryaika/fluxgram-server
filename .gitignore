@@ -1,0 +1,57 @@
+# Go build artifacts
+/bin/
+*.exe
+# Root build output from `go build ./...` -- never a repo artifact.
+/telesrv
+/telesrv-admin
+/telesrv-load
+/telesrv-update
+/gramsrv-backup
+*.test
+*.out
+coverage.*
+node_modules/
+
+# Python caches (cmd/bots/*.py demo bots)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 本地环境 / 密钥（server RSA private key 必须持久化，但禁止入库）
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+/secrets/
+/data/*
+!/data/langpack/
+!/data/langpack/**
+logs/
+tmp/
+.gocache/
+.tdesktop-e2e/
+
+# start-server.sh/bat generated files
+.public_ip
+.link_prefix
+.secrets
+.docker_naming
+.db_naming
+.server_panel.json
+
+# Local-only destructive dev tool (deletes .env, data/, Docker volumes) --
+# never belongs in the repo.
+/wipe-server.bat
+
+# IDE
+.idea/
+.vscode/
+*.exe~
+
+/dist/
+
+# Web client build embedded by internal/webclient (built by owpengram-web-client's
+# `node scripts/owpengram-web.mjs embed`). Committed so a plain `git clone` +
+# `go build` serves the web client with no Node/pnpm required at runtime.
