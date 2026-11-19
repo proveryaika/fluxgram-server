@@ -1,0 +1,348 @@
+package main
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"telesrv/internal/identity"
+)
+
+func TestValidateAdminPassword(t *testing.T) {
+	cases := []struct {
+		name     string
+		password string
+		want     error
+	}{
+		{"ok", "correct horse battery", nil},
+		// No length floor: the operator picks the password, however short.
+		{"a single character", "x", nil},
+		{"blank", "   ", errPasswordBlank},
+		{"empty", "", errPasswordBlank},
+		// bcrypt truncates silently past 72 bytes, so anything longer must be
+		// refused rather than accepted as a password the operator did not set.
+		{"past bcrypt's input limit", strings.Repeat("a", 73), errPasswordTooLong},
+		{"73 bytes of multibyte runes", strings.Repeat("é", 37), errPasswordTooLong},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAdminPassword(tc.password)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("validateAdminPassword(%q) = %v, want %v", tc.password, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateAdminUsername(t *testing.T) {
+	valid := []string{"admin", "ops.lead", "on-call_2", strings.Repeat("a", 64)}
+	for _, username := range valid {
+		if err := validateAdminUsername(username); err != nil {
+			t.Errorf("validateAdminUsername(%q) = %v, want nil", username, err)
+		}
+	}
+	invalid := []string{
+		"",
+		"ab",                    // under the floor
+		strings.Repeat("a", 65), // over the ceiling
+		"has space",
+		"with\ttab",
+		"with\nnewline",
+		"аdmin",  // Cyrillic 'а': renders like "admin" but is a different operator
+		"admin*", // permission wildcard has no business in a name
+		"a@b",
+	}
+	for _, username := range invalid {
+		if err := validateAdminUsername(username); !errors.Is(err, errUsernameInvalid) {
+			t.Errorf("validateAdminUsername(%q) = %v, want errUsernameInvalid", username, err)
+		}
+	}
+}
+
+func TestHashAdminPasswordRoundTrips(t *testing.T) {
+	const password = "a sufficiently long password"
+	hash, err := hashAdminPassword(password)
+	if err != nil {
+		t.Fatalf("hashAdminPassword: %v", err)
+	}
+	if strings.Contains(hash, password) {
+		t.Fatal("hash contains the plaintext")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
+		t.Fatalf("hash does not verify against its own password: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password+"x")); err == nil {
+		t.Fatal("hash verified against the wrong password")
+	}
+	if cost, err := bcrypt.Cost([]byte(hash)); err != nil || cost != bcryptCost {
+		t.Fatalf("cost = %d (err %v), want %d", cost, err, bcryptCost)
+	}
+}
+
+func TestHashAdminPasswordRejectsInvalid(t *testing.T) {
+	// A short password is fine; an absent one is not.
+	if _, err := hashAdminPassword("x"); err != nil {
+		t.Fatalf("a one-character password was refused: %v", err)
+	}
+	if _, err := hashAdminPassword("   "); !errors.Is(err, errPasswordBlank) {
+		t.Fatalf("err = %v, want errPasswordBlank", err)
+	}
+	if _, err := hashAdminPassword(strings.Repeat("a", 73)); !errors.Is(err, errPasswordTooLong) {
+		t.Fatalf("err = %v, want errPasswordTooLong", err)
+	}
+}
+
+// The dummy hash exists so a login against an unknown username costs the same
+// bcrypt work as a real one. If it were malformed, CompareHashAndPassword would
+// return early and hand back the timing signal it is there to remove.
+func TestDummyBcryptHashIsWellFormedAndUnusable(t *testing.T) {
+	cost, err := bcrypt.Cost([]byte(dummyBcryptHash))
+	if err != nil {
+		t.Fatalf("dummy hash is not a valid bcrypt hash: %v", err)
+	}
+	if cost != bcryptCost {
+		t.Fatalf("dummy hash cost = %d, want %d -- it must cost the same as a real one", cost, bcryptCost)
+	}
+	for _, guess := range []string{"", "password", "admin", dummyBcryptHash} {
+		if err := bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(guess)); err == nil {
+			t.Fatalf("dummy hash authenticated %q", guess)
+		}
+	}
+}
+
+func TestNormalisePermissions(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"trims and drops empties", []string{" a ", "", "  ", "b"}, []string{"a", "b"}},
+		{"de-duplicates", []string{"a", "a", "b", "a"}, []string{"a", "b"}},
+		// A stored list that both names the wildcard and lists rights would read
+		// narrower than it actually is wherever it is displayed.
+		{"wildcard collapses everything", []string{"a", "*", "b"}, []string{permissionAll}},
+		{"wildcard alone", []string{"*"}, []string{permissionAll}},
+		{"empty stays empty", []string{}, []string{}},
+		{"only blanks", []string{"", " "}, []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalisePermissions(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("normalisePermissions(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("normalisePermissions(%v) = %v, want %v", tc.in, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// assignablePermissions drives the account editor. Offering "*" there would let
+// a click hand out every right including admins.manage, which is exactly what
+// the per-permission list exists to make deliberate.
+func TestAssignablePermissionsExcludesWildcard(t *testing.T) {
+	for _, p := range assignablePermissions() {
+		if p == permissionAll {
+			t.Fatal("assignablePermissions offers the wildcard")
+		}
+	}
+	var sawAdminsManage bool
+	for _, p := range assignablePermissions() {
+		if p == permissionAdminsManage {
+			sawAdminsManage = true
+		}
+	}
+	if !sawAdminsManage {
+		t.Fatal("assignablePermissions omits admins.manage, so it could never be granted")
+	}
+}
+
+// A blank username must never authenticate, even with the correct break-glass
+// secret. It briefly did, which made an empty field an unnamed second route to
+// the highest-privilege login; the operator has to be asked for by name.
+func TestBlankUsernameNeverAuthenticates(t *testing.T) {
+	s := &server{cfg: uiConfig{Password: "letmein", Permissions: []string{permissionAll}}}
+	for _, username := range []string{"", "   ", "\t"} {
+		if _, ok := s.authenticateLogin(t.Context(), loginRequest{Username: username, Secret: "letmein"}); ok {
+			t.Fatalf("blank username %q authenticated", username)
+		}
+	}
+	// The same secret under the operator's actual name still works, so the
+	// check above is refusing the blank name rather than the credential.
+	identity, ok := s.authenticateLogin(t.Context(), loginRequest{Username: breakGlassUsername, Secret: "letmein"})
+	if !ok {
+		t.Fatal("the break-glass operator could not sign in by name")
+	}
+	if identity.actor != breakGlassUsername {
+		t.Fatalf("actor = %q, want %q", identity.actor, breakGlassUsername)
+	}
+	if identity.userID != 0 {
+		t.Fatalf("userID = %d, want 0 -- the break-glass operator has no database row", identity.userID)
+	}
+}
+
+// Case is not a way to get a different operator: the name resolves to the
+// break-glass login however it is typed, matching the case-insensitive unique
+// index that named accounts live under.
+func TestBreakGlassUsernameIsCaseInsensitive(t *testing.T) {
+	s := &server{cfg: uiConfig{Password: "letmein", Permissions: []string{permissionAll}}}
+	for _, username := range []string{"fluxgram", "FluxGram", "FLUXGRAM", " fluxgram "} {
+		identity, ok := s.authenticateLogin(t.Context(), loginRequest{Username: username, Secret: "letmein"})
+		if !ok {
+			t.Fatalf("%q did not resolve to the break-glass operator", username)
+		}
+		if identity.actor != breakGlassUsername {
+			t.Fatalf("%q signed in as %q", username, identity.actor)
+		}
+	}
+	if _, ok := s.authenticateLogin(t.Context(), loginRequest{Username: breakGlassUsername, Secret: "wrong"}); ok {
+		t.Fatal("the break-glass operator authenticated with the wrong secret")
+	}
+}
+
+// The break-glass password quickstart generates for the very first login
+// must stop authenticating once the first-run wizard is done, but a
+// password an operator actually chose -- even one that happens to still be
+// sitting in .env from before the wizard finished -- must never be
+// affected by that. This is the actual integration point between
+// validSecret and identity.Store; the package's own tests cover
+// SetupPending/TemporaryPasswordMatches in isolation.
+func TestValidSecretRetiresOnlyTheGeneratedPassword(t *testing.T) {
+	dir := t.TempDir()
+	store := identity.NewStore(dir)
+	s := &server{cfg: uiConfig{Password: "generated-once", Permissions: []string{permissionAll}}, identity: store}
+
+	// No marker written at all yet (identity.Store's zero state) -- the
+	// password behaves like an ordinary one an operator set.
+	if !s.validSecret("generated-once") {
+		t.Fatal("password should authenticate before any wizard marker exists")
+	}
+
+	// Bootstrap-style: the setup-pending marker plus the matching
+	// temporary-password marker, exactly as tui-panel/server-panel.py's
+	// bootstrap_env() writes them on a fresh install.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".setup_pending"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".admin_password_temporary"), []byte("generated-once"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !s.validSecret("generated-once") {
+		t.Fatal("the generated password must keep working while the wizard is still pending")
+	}
+
+	// Wizard finishes: MarkSetupComplete removes both markers.
+	if err := store.MarkSetupComplete(); err != nil {
+		t.Fatal(err)
+	}
+	if s.validSecret("generated-once") {
+		t.Fatal("the generated password must stop authenticating once setup is complete")
+	}
+
+	// An operator-chosen password behaves normally regardless: setting a
+	// new .env value (this test's stand-in for that) authenticates whether
+	// or not a wizard ever ran, because it never matches either marker.
+	s.cfg.Password = "an-operator-actually-chose-this"
+	if !s.validSecret("an-operator-actually-chose-this") {
+		t.Fatal("an operator-chosen password must authenticate after setup completion, same as always")
+	}
+}
+
+// A session for a named account must not be trusted on the strength of its
+// signature alone: the account's rights are re-read per request, and a nil read
+// store has to fail closed rather than fall back to the claims. A nil store is
+// an infrastructure gap, not a confirmed revocation, so it must not report
+// revoked=true either -- see TestCurrentSessionPermissionsTransientErrorDoesNotRevoke.
+func TestCurrentSessionPermissionsFailsClosedWithoutStore(t *testing.T) {
+	s := &server{}
+	_, ok, revoked := s.currentSessionPermissions(t.Context(), sessionClaims{
+		UserID:      7,
+		Epoch:       1,
+		Permissions: []string{permissionAll},
+	})
+	if ok {
+		t.Fatal("a named-account session was accepted with no store to verify it against")
+	}
+	if revoked {
+		t.Fatal("no read store is an infrastructure gap, not a confirmed revocation -- must not report revoked")
+	}
+}
+
+// The break-glass operator has no row to re-read, so it keeps the configured
+// rights -- that login is the way back in when the database is unreachable.
+func TestCurrentSessionPermissionsAllowsBreakGlass(t *testing.T) {
+	s := &server{}
+	perms, ok, revoked := s.currentSessionPermissions(t.Context(), sessionClaims{
+		UserID:      0,
+		Permissions: []string{permissionServerManage},
+	})
+	if !ok {
+		t.Fatal("break-glass session rejected")
+	}
+	if revoked {
+		t.Fatal("break-glass session must never report revoked")
+	}
+	if !perms.Has(permissionServerManage) {
+		t.Fatal("break-glass session lost its configured permission")
+	}
+	if perms.Has(permissionAdminsManage) {
+		t.Fatal("break-glass session gained a permission it was not configured with")
+	}
+}
+
+// A transient failure re-reading a named account's row (the database pool
+// still warming up right after an admin-panel restart, a dropped connection,
+// ...) must refuse this one request without telling requireAuthAPI to clear
+// the session cookie -- otherwise a single slow query outlives its own
+// request and logs the operator out for good, exactly the "Still
+// restarting..." lockout this was written to stop recurring.
+func TestClassifySessionStateTransientErrorDoesNotRevoke(t *testing.T) {
+	ok, revoked := classifySessionState(false, 0, 1, errors.New("dial tcp: connection refused"))
+	if ok {
+		t.Fatal("a failed read must not be accepted")
+	}
+	if revoked {
+		t.Fatal("a transient read error must not be reported as a confirmed revocation")
+	}
+}
+
+// A row that genuinely does not exist any more (the account was deleted) is
+// a real revocation, unlike a bare connection failure -- this is the one
+// error case that must still clear the cookie.
+func TestClassifySessionStateMissingAccountRevokes(t *testing.T) {
+	ok, revoked := classifySessionState(false, 0, 1, errAdminUserNotFound)
+	if ok {
+		t.Fatal("a session for a deleted account must not be accepted")
+	}
+	if !revoked {
+		t.Fatal("a deleted account must be reported as a confirmed revocation")
+	}
+}
+
+// A disabled account or a moved token_epoch (password reset, rights edited)
+// is also a confirmed revocation, with no error involved at all.
+func TestClassifySessionStateDisabledOrEpochMismatchRevokes(t *testing.T) {
+	if ok, revoked := classifySessionState(false, 1, 1, nil); ok || !revoked {
+		t.Fatalf("disabled account: ok=%v revoked=%v, want ok=false revoked=true", ok, revoked)
+	}
+	if ok, revoked := classifySessionState(true, 2, 1, nil); ok || !revoked {
+		t.Fatalf("epoch mismatch: ok=%v revoked=%v, want ok=false revoked=true", ok, revoked)
+	}
+}
+
+func TestClassifySessionStateEnabledMatchingEpochAllows(t *testing.T) {
+	ok, revoked := classifySessionState(true, 1, 1, nil)
+	if !ok || revoked {
+		t.Fatalf("ok=%v revoked=%v, want ok=true revoked=false", ok, revoked)
+	}
+}
