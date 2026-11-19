@@ -1,0 +1,1293 @@
+// AccountUsername is one collectible username the peer holds. Active mirrors the
+// username#b4073647 flag: an inactive collectible is owned but does not resolve.
+export type AccountUsername = {
+  Username: string;
+  Active: boolean;
+};
+
+export type AccountRow = {
+  ID: number;
+  Phone: string;
+  Username: string;
+  FirstName: string;
+  LastName: string;
+  // Collectible usernames in projection order; never includes the editable slot
+  // above. Always an array, so it can be iterated unconditionally.
+  Collectibles: AccountUsername[];
+  CreatedAt: string;
+  UpdatedAt: string;
+  Frozen: boolean;
+  Reason: string;
+  Verified: boolean;
+  Scam: boolean;
+  Fake: boolean;
+  PremiumUntil: number;
+  LastActiveAt: string;
+  DeviceCount: number;
+  LoginEmail: string;
+};
+
+export type RestrictionRow = {
+  Frozen: boolean;
+  Since: string | null;
+  Until: string | null;
+  AppealURL: string;
+  Reason: string;
+  Actor: string;
+  CommandID: string;
+  UpdatedAt: string;
+};
+
+export type AuthorizationRow = {
+  AuthKeyID: string;
+  Hash: string;
+  Layer: number;
+  DeviceModel: string;
+  Platform: string;
+  SystemVersion: string;
+  APIID: number;
+  AppVersion: string;
+  IP: string;
+  PasswordPending: boolean;
+  CreatedAt: string;
+  ActiveAt: string;
+};
+
+export type AuditLogRow = {
+  ID: number;
+  CommandID: string;
+  Actor: string;
+  Action: string;
+  DryRun: boolean;
+  Reason: string;
+  Status: string;
+  Error: string;
+  Result: string;
+  CreatedAt: string;
+  // Only populated by the global listing (GET /api/audit-logs) -- the
+  // per-account/channel/bot AuditLogs arrays already know their own target
+  // from the page they're embedded in.
+  TargetType?: string;
+  TargetID?: number;
+};
+
+export type PremiumPlan = {
+  Months: number;
+  DurationDays: number;
+  AmountStars: number;
+  Enabled: boolean;
+  SortOrder: number;
+  Label: string;
+  ManagedBy: string;
+  Version: number;
+  UpdatedAt: number;
+};
+
+export type PremiumPlanListResponse = {
+  rows: PremiumPlan[];
+};
+
+export type DonationChain = {
+  Key: string;
+  Name: string;
+  ChainID: number;
+  RPCURL: string;
+  WSURL: string;
+  NativeSymbol: string;
+  NativeDecimals: number;
+  ConfirmationsRequired: number;
+  PriceFeedAddress: string;
+  ManualUSDRateMicros: number;
+  Enabled: boolean;
+  ExplorerURL: string;
+  PriceSource: string;
+  PriceSourceID: string;
+  PriceUpdatedAt: string;
+};
+
+export type DonationSettings = {
+  star_price_micros: number;
+};
+
+export type DonationPricePreview = {
+  source_id: string;
+  usd_rate_micros: number;
+};
+
+export type DonationToken = {
+  ChainKey: string;
+  Symbol: string;
+  ContractAddress: string;
+  Decimals: number;
+};
+
+export type DonationChainsResponse = {
+  chains: DonationChain[];
+  tokens: DonationToken[];
+};
+
+export type DonationWalletStatus = {
+  HasWallet: boolean;
+  AddressCount: number;
+};
+
+export type DonationDepositStatus = "pending" | "confirmed" | "credited" | "orphaned";
+
+export type DonationDepositRow = {
+  ID: number;
+  UserID: number;
+  ChainKey: string;
+  TokenSymbol: string;
+  TxHash: string;
+  LogIndex: number;
+  BlockNumber: number;
+  AmountRaw: string;
+  USDValueMicros: number;
+  StarsCredited: number;
+  Status: DonationDepositStatus;
+  Confirmations: number;
+  DetectedAt: string;
+  CreditedAt: string;
+  UserPhone: string;
+  UserFirstName: string;
+};
+
+export type DonationDepositListResponse = {
+  rows: DonationDepositRow[];
+  has_more: boolean;
+  next_before_id: string;
+};
+
+export type DonationChainAssetBalance = {
+  Symbol: string;
+  Decimals: number;
+  TotalRaw: string;
+  AddressCount: number;
+  USDValueMicros: number;
+};
+
+export type DonationChainBalance = {
+  ChainKey: string;
+  Assets: DonationChainAssetBalance[];
+  TotalUSDValueMicros: number;
+};
+
+export type AccountRatingEventKind = "stars" | "activity" | "moderation" | "manual" | "recompute";
+
+export type AccountRatingRow = {
+  UserID: string;
+  Username: string;
+  FirstName: string;
+  Level: number;
+  Stars: string;
+  CurrentLevelStars: string;
+  NextLevelStars: string;
+  HasNextLevel: boolean;
+  StarsComponent: string;
+  ActivityComponent: string;
+  PenaltyComponent: string;
+  ManualComponent: string;
+  PendingStars: string;
+  PendingDate: string;
+  ComputedAt: string;
+  UpdatedAt: string;
+  Version: string;
+  Computed: boolean;
+};
+
+export type AccountRatingListResponse = {
+  rows: AccountRatingRow[];
+  has_more: boolean;
+  next_before_id: string;
+};
+
+export type AccountRatingEventRow = {
+  ID: string;
+  UserID: string;
+  Kind: AccountRatingEventKind;
+  Amount: string;
+  Reason: string;
+  Actor: string;
+  CommandKey: string;
+  CreatedAt: string;
+};
+
+export type AccountRatingDetail = {
+  rating: AccountRatingRow;
+  events: AccountRatingEventRow[];
+};
+
+export type PremiumPaymentIntent = {
+  ID: number;
+  FormID: number;
+  BuyerUserID: number;
+  Kind: "self" | "gift";
+  RecipientUserID: number;
+  Months: number;
+  DurationDays: number;
+  AmountStars: number;
+  PlanVersion: number;
+  Status: "pending" | "paid" | "expired" | "refunded";
+  IssuedAt: number;
+  ExpiresAt: number;
+  PaidAt: number;
+  RefundedAt: number;
+  StarsTransactionID: number;
+  CreatedAt: number;
+  UpdatedAt: number;
+};
+
+export type AuditLogListResponse = {
+  rows: AuditLogRow[];
+};
+
+export type AccountDetail = {
+  Account: AccountRow;
+  About: string;
+  LastSeenAt: number;
+  Verified: boolean;
+  Scam: boolean;
+  Fake: boolean;
+  Support: boolean;
+  Bot: boolean;
+  Restriction: RestrictionRow;
+  HasRestriction: boolean;
+  Authorizations: AuthorizationRow[];
+  AuditLogs: AuditLogRow[];
+};
+
+export type ChannelRow = {
+  ID: number;
+  AccessHash: number;
+  CreatorUserID: number;
+  Title: string;
+  About: string;
+  Username: string;
+  Broadcast: boolean;
+  Megagroup: boolean;
+  Forum: boolean;
+  Monoforum: boolean;
+  Verified: boolean;
+  Scam: boolean;
+  Fake: boolean;
+  Gigagroup: boolean;
+  Deleted: boolean;
+  AntiSpam: boolean;
+  ParticipantsHidden: boolean;
+  NoForwards: boolean;
+  JoinToSend: boolean;
+  JoinRequest: boolean;
+  SlowmodeSeconds: number;
+  ParticipantsCount: number;
+  AdminsCount: number;
+  KickedCount: number;
+  BannedCount: number;
+  TopMessageID: number;
+  PinnedMessageID: number;
+  PTS: number;
+  Date: number;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type ChannelDetail = {
+  Channel: ChannelRow;
+  ChannelJSON: string;
+  AuditLogs: AuditLogRow[];
+};
+
+export type BotRow = {
+  ID: number;
+  Username: string;
+  FirstName: string;
+  Verified: boolean;
+  Scam: boolean;
+  Fake: boolean;
+  System: boolean;
+  OwnerUserID: number;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type BotDetail = {
+  Bot: BotRow;
+  About: string;
+  Description: string;
+  OwnerUsername: string;
+  AuditLogs: AuditLogRow[];
+};
+
+export type MessageRow = {
+  OwnerUserID: number;
+  BoxID: number;
+  PrivateMessageID: number;
+  MessageSenderID: number;
+  PeerID: number;
+  FromUserID: number;
+  Date: number;
+  Outgoing: boolean;
+  Body: string;
+  PTS: number;
+  Deleted: boolean;
+  Media: string;
+};
+
+export type GroupMessageRow = {
+  ChannelID: number;
+  ID: number;
+  SenderUserID: number;
+  FromPeerType: string;
+  FromPeerID: number;
+  Date: number;
+  Post: boolean;
+  Body: string;
+  PTS: number;
+  Deleted: boolean;
+  Media: string;
+  ViewsCount: number;
+  EditDate: number;
+  Pinned: boolean;
+};
+
+export type UpdateEventRow = {
+  PTS: number;
+  PTSCount: number;
+  Type: string;
+  Date: number;
+  JSON: string;
+};
+
+export type ChannelUpdateEventRow = {
+  PTS: number;
+  PTSCount: number;
+  Type: string;
+  MessageID: number;
+  Date: number;
+  SenderUserID: number;
+  JSON: string;
+};
+
+export type OutboxRow = {
+  ID: number;
+  TargetUserID: number;
+  PTS: number;
+  EventType: string;
+  Status: string;
+  Attempts: number;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type ModerationPeer = {
+  Type: "user" | "channel";
+  ID: number;
+};
+
+export type ModerationCaseRow = {
+  ID: number;
+  Target: ModerationPeer;
+  Status: string;
+  Severity: number;
+  AssignedTo: string;
+  Version: number;
+  ReportCount: number;
+  DistinctReporterCount: number;
+  FirstReportAt: string;
+  LastReportAt: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type ModerationDecision = {
+  ID: number;
+  CaseID: number;
+  AppealID: number;
+  Kind: string;
+  Actor: string;
+  Reason: string;
+  CommandID: string;
+  CreatedAt: string;
+};
+
+export type ModerationAction = {
+  ID: number;
+  CaseID: number;
+  DecisionID: number;
+  Kind: string;
+  Payload: Record<string, unknown>;
+  Status: string;
+  Attempts: number;
+  LastError: string;
+  CommandID: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type ModerationAppeal = {
+  ID: number;
+  CaseID: number;
+  AppellantUserID: number;
+  Text: string;
+  Status: string;
+  PreviousCaseStatus: string;
+  Reviewer: string;
+  ReviewReason: string;
+  CreatedAt: string;
+  ReviewedAt: string;
+};
+
+export type ModerationCaseDetail = {
+  Case: ModerationCaseRow;
+  ReportIDs: number[];
+  Decisions: ModerationDecision[];
+  Actions: ModerationAction[];
+  Appeals: ModerationAppeal[];
+};
+
+export type ModerationReport = {
+  ID: number;
+  ReporterUserID: number;
+  Source: string;
+  Target: ModerationPeer;
+  Reason: string;
+  Option: string;
+  Comment: string;
+  Items: Array<Record<string, unknown>>;
+  MediaHolds: Array<Record<string, unknown>>;
+  CreatedAt: string;
+};
+
+export type CollectibleUsernameStatus = "vault" | "owned" | "burned";
+
+export type CollectiblePeerType = "" | "user" | "channel";
+
+export type CollectibleCurrency = "XTR" | "TON" | "USD";
+
+// int64 columns arrive as JSON strings to survive the 2^53 boundary.
+export type CollectibleUsernameRow = {
+  ID: string;
+  Username: string;
+  Status: CollectibleUsernameStatus;
+  OwnerPeerType: CollectiblePeerType;
+  OwnerPeerID: string;
+  OwnerUsername: string;
+  OwnerName: string;
+  PurchaseDate: string;
+  Currency: CollectibleCurrency;
+  Amount: string;
+  CryptoCurrency: string;
+  CryptoAmount: string;
+  URL: string;
+  OriginalOwnerPeerType: string;
+  OriginalOwnerPeerID: string;
+  OriginalOwnerUsername: string;
+  TransferCount: number;
+  Version: string;
+  // Mirrors the holder's username-registry row: an owned asset can still be
+  // hidden from the profile.
+  RegistryActive: boolean;
+  RegistrySortOrder: number;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type CollectibleUsernameTransferKind = "mint" | "transfer" | "revoke" | "burn";
+
+export type CollectibleUsernameTransferRow = {
+  ID: string;
+  CollectibleID: string;
+  Kind: CollectibleUsernameTransferKind;
+  FromPeerType: string;
+  FromPeerID: string;
+  FromUsername: string;
+  ToPeerType: string;
+  ToPeerID: string;
+  ToUsername: string;
+  Currency: string;
+  Amount: string;
+  Actor: string;
+  Reason: string;
+  CommandKey: string;
+  CreatedAt: string;
+};
+
+export type CollectibleUsernameListResponse = {
+  rows: CollectibleUsernameRow[] | null;
+  has_more: boolean;
+  next_before_id: string;
+};
+
+export type CollectibleUsernameDetail = {
+  asset: CollectibleUsernameRow;
+  transfers: CollectibleUsernameTransferRow[] | null;
+};
+
+// Official platform verification. Every int64 the backend tags `,string` stays a
+// decimal string here: application ids, peer ids and the optimistic-locking
+// version all outgrow the exact range of a JSON number, and a rounded version
+// would send a decision against the wrong revision of the row.
+export type VerificationTargetType = "bot" | "channel" | "supergroup" | "user";
+
+export type VerificationStatus =
+  | "draft"
+  | "submitted"
+  | "in_review"
+  | "approved"
+  | "rejected"
+  | "cancelled";
+
+export type VerificationEventKind =
+  | "created"
+  | "updated"
+  | "submitted"
+  | "claimed"
+  | "approved"
+  | "rejected"
+  | "cancelled"
+  | "revoked"
+  | "notified";
+
+export type VerificationApplicationRow = {
+  ID: string;
+  ApplicantUserID: string;
+  ApplicantUsername: string;
+  ApplicantName: string;
+  TargetType: VerificationTargetType;
+  TargetID: string;
+  TargetTitle: string;
+  TargetUsername: string;
+  TargetVerified: boolean;
+  Category: string;
+  Description: string;
+  OfficialWebsite: string;
+  // Go marshals an empty slice as null, so both shapes have to be tolerated.
+  SocialLinks: string[] | null;
+  PressLinks: string[] | null;
+  AdditionalNote: string;
+  Status: VerificationStatus;
+  ReviewerAdminID: string;
+  DecisionReason: string;
+  // InternalNote is the reviewer handover note: operator-only, never shown to the
+  // applicant.
+  InternalNote: string;
+  CorrelationID: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+  SubmittedAt: string;
+  ReviewedAt: string;
+  Version: string;
+};
+
+export type VerificationEventRow = {
+  ID: string;
+  Kind: VerificationEventKind;
+  FromStatus: string;
+  ToStatus: string;
+  Actor: string;
+  Reason: string;
+  Note: string;
+  CreatedAt: string;
+};
+
+export type VerificationApplicationListResponse = {
+  rows: VerificationApplicationRow[] | null;
+  has_more: boolean;
+  next_before_id: string;
+};
+
+export type VerificationApplicationDetail = {
+  application: VerificationApplicationRow;
+  events: VerificationEventRow[] | null;
+  // Both flags describe the target as it is now, not as it was at submission.
+  applicant_controls_target: boolean;
+  target_verified: boolean;
+};
+
+// Counts are decimal strings for the same exactness reason as the ids; the
+// backend always sends all six statuses.
+export type VerificationCountsResponse = {
+  counts: Record<string, string> | null;
+};
+
+// Third-party bot verification (core.telegram.org/api/bots/verification): a
+// verifier bot marks a peer with its OWN icon and description, rendered before the
+// name. It is a different mechanism from the official checkmark above — the two
+// never read each other's state — so it gets its own row types rather than reusing
+// VerificationApplicationRow.
+//
+// Every int64 the backend tags `,string` stays a decimal string here: bot ids, peer
+// ids, custom emoji document ids and the optimistic-locking version all outgrow the
+// exact range of a JSON number.
+export type BotVerificationPeerType = "user" | "channel";
+
+export type CustomVerificationRequestStatus = "pending" | "approved" | "rejected" | "revoked";
+
+// MarkCount is tagged `,string` like the ids (it is the count that would cascade
+// away with a revocation, read as int64), while VerificationIconRow.UsedByVerifiers
+// is a plain number — it counts verifier rows and cannot approach the exactness
+// limit. Both are rendered through String(), so neither shape can surprise a cell.
+export type BotVerifierRow = {
+  BotID: string;
+  BotUsername: string;
+  BotName: string;
+  // IconDocumentID is the custom emoji document the verifier marks with. Clients
+  // resolve it through messages.getCustomEmojiDocuments, so an id naming no
+  // fetchable document renders as no badge at all.
+  IconDocumentID: string;
+  IconName: string;
+  CompanyName: string;
+  DefaultDescription: string;
+  // CanModifyCustomDescription mirrors botVerifierSettings flags.1: when false the
+  // verifier may only apply DefaultDescription.
+  CanModifyCustomDescription: boolean;
+  // Enabled is the operator kill switch: a disabled verifier keeps its granted
+  // marks but can no longer mark anything new.
+  Enabled: boolean;
+  GrantedBy: string;
+  GrantReason: string;
+  MarkCount: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+  Version: string;
+};
+
+export type VerificationIconRow = {
+  ID: string;
+  DocumentID: string;
+  // OwnerBotID is "0" for a catalogue entry any verifier may use, and a bot id
+  // when the operator reserved the icon for one verifier.
+  OwnerBotID: string;
+  OwnerBotUsername: string;
+  Name: string;
+  Active: boolean;
+  UsedByVerifiers: number;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type CustomVerificationRow = {
+  ID: string;
+  VerifierBotID: string;
+  VerifierBotUsername: string;
+  CompanyName: string;
+  PeerType: BotVerificationPeerType;
+  PeerID: string;
+  PeerTitle: string;
+  PeerUsername: string;
+  // Denormalised at grant time, so a mark keeps the icon it was granted with even
+  // after the verifier changes its own.
+  IconDocumentID: string;
+  Description: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+  Version: string;
+};
+
+export type CustomVerificationRequestRow = {
+  ID: string;
+  VerifierBotID: string;
+  VerifierBotUsername: string;
+  ApplicantUserID: string;
+  ApplicantUsername: string;
+  PeerType: BotVerificationPeerType;
+  PeerID: string;
+  PeerTitle: string;
+  PeerUsername: string;
+  Reason: string;
+  RequestedDescription: string;
+  Status: CustomVerificationRequestStatus;
+  DecidedBy: string;
+  DecisionReason: string;
+  // InternalNote is the operator handover note: never shown to the applicant.
+  InternalNote: string;
+  CorrelationID: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+  ApprovedAt: string;
+  RejectedAt: string;
+  Version: string;
+};
+
+export type BotVerifierListResponse = {
+  rows: BotVerifierRow[] | null;
+};
+
+export type VerificationIconListResponse = {
+  rows: VerificationIconRow[] | null;
+};
+
+export type CustomVerificationListResponse = {
+  rows: CustomVerificationRow[] | null;
+  has_more: boolean;
+  next_before_id: string;
+};
+
+export type CustomVerificationRequestListResponse = {
+  rows: CustomVerificationRequestRow[] | null;
+  has_more: boolean;
+  next_before_id: string;
+};
+
+export type CustomVerificationRequestDetail = {
+  request: CustomVerificationRequestRow;
+  // The verifier row as it is now: it can be disabled, or revoked entirely, after
+  // the application was filed.
+  verifier: BotVerifierRow | null;
+  // mark_active describes the peer right now, not the application status: an
+  // approved application whose mark a verifier later withdrew reads false.
+  mark_active: boolean;
+};
+
+// Counts are decimal strings for the same exactness reason as the ids; the backend
+// always sends all four statuses.
+export type BotVerificationCountsResponse = {
+  counts: Record<string, string> | null;
+};
+
+export type AdminSession = {
+  actor: string;
+  // The right set the signed session was issued with; ["*"] means everything.
+  permissions?: string[] | null;
+  // Mirrors the server's TELESRV_HIDE_THIRD_PARTY_VERIFICATION (default true):
+  // while true, the panel drops the "Third-party marks" nav entry and its
+  // routes, regardless of what permissions the session carries -- the feature
+  // is not fully finished. The server also refuses the underlying routes with
+  // 404, so this is a UI convenience on top of a real enforcement, not the
+  // enforcement itself.
+  hide_third_party_verification?: boolean;
+  // Mirrors the server's TELESRV_DONATIONS_ENABLED (default true): while
+  // false, the panel drops the "Donations" nav entry and its route,
+  // regardless of what permissions the session carries -- the feature
+  // itself is switched off server-wide, so every action under it would just
+  // fail. The server also refuses the underlying routes with 404, so this
+  // is a UI convenience on top of a real enforcement, not the enforcement
+  // itself. Missing/undefined is treated as true (an admin binary older
+  // than this field never gates on it), matching the config default.
+  donations_enabled?: boolean;
+  // False until the first-run setup wizard has been finished -- see
+  // identity.Store.SetupPending. Missing/undefined is treated as true (an
+  // admin binary older than this field never gates on it), so only an
+  // explicit false shows the wizard.
+  setup_completed?: boolean;
+  // Whether the wizard's storage step is done (.env says where PostgreSQL
+  // lives), and whether fluxgram-server is listening yet. Missing is read
+  // as true/true, like setup_completed.
+  storage_configured?: boolean;
+  server_ready?: boolean;
+  // Random per admin-process-start value -- see the Go handler's doc
+  // comment. Used by Server Settings' Restart/Update flow to detect a
+  // genuinely new admin process after asking it to bounce.
+  boot_id?: string;
+  // Every MTProto TL schema layer this server binary can admit and encode
+  // for (oldest first) -- the server is multi-layer, so this is the whole
+  // supported set, not just the newest one. Shown in the sidebar footer
+  // above the build/commit line.
+  api_layers?: number[];
+  // The release line this binary belongs to ("O8"), and what the daily
+  // GitHub check found. `update.available` is true when a newer release is
+  // published; `update.url` is its release page (the update itself is manual).
+  version?: string;
+  update?: {
+    enabled: boolean;
+    current: string;
+    latest?: string;
+    available: boolean;
+    url?: string;
+    notes?: string;
+  };
+  // This admin binary's own build -- shown under "Version" in the sidebar
+  // footer so an operator can tell which build is actually running.
+  build?: {
+    commit: string;
+    short_commit: string;
+    dirty: boolean;
+    build_time: string;
+  };
+};
+
+export type AdminLoginResult = AdminSession & {
+  csrf_token: string;
+};
+
+export type MessageDetail = {
+  Message: MessageRow;
+  MessageJSON: string;
+  DialogJSON: string;
+  PrivateJSON: string;
+  UpdateEvents: UpdateEventRow[];
+  Outbox: OutboxRow[];
+};
+
+export type GroupMessageDetail = {
+  Message: GroupMessageRow;
+  MessageJSON: string;
+  ChannelJSON: string;
+  UpdateEvents: ChannelUpdateEventRow[];
+};
+
+export type CommandResult = {
+  command_id: string;
+  action: string;
+  status: string;
+  already_executed: boolean;
+  dry_run: boolean;
+  target_user_id?: number;
+  target_peer?: unknown;
+  message: string;
+  details?: Record<string, unknown>;
+  error?: string;
+};
+
+export type StickerSetRow = {
+  // String, not number: these are 18-19 digit snowflake ids, past JS's 2^53
+  // safe-integer limit.
+  ID: string;
+  ShortName: string;
+  Title: string;
+  Count: number;
+  Kind: string;
+  SystemKey: string;
+  Official: boolean;
+  Archived: boolean;
+  Installed: boolean;
+  SortOrder: number;
+  CreatedAt: string;
+  // Id of the set's first document, for a small list thumbnail — empty when
+  // the set has no documents. Same string-not-number reasoning as ID.
+  CoverDocumentID: string;
+};
+
+export type StickerSetListResponse = { rows: StickerSetRow[] };
+
+// GifCatalogCategories mirrors domain.GifCatalogCategories -- the titles
+// internal/seed/catalog/emoji_groups.json uses for the GIF picker's category
+// icons. "" (rendered as "Uncategorized") is always a valid value too.
+export const GIF_CATALOG_CATEGORIES = [
+  "Love", "Approval", "Disapproval", "Cheers", "Laughter",
+  "Astonishment", "Sadness", "Anger", "Neutral", "Doubt", "Silly",
+];
+
+export type GifCatalogRow = {
+  // String, not number: 18-19 digit snowflake ids, past JS's 2^53
+  // safe-integer limit.
+  ID: string;
+  Title: string;
+  DocumentID: string;
+  Enabled: boolean;
+  SortOrder: number;
+  Category: string;
+  CreatedBy: string;
+  CreatedAt: string;
+};
+
+export type GifCatalogListResponse = { rows: GifCatalogRow[] };
+
+// StarGiftCatalogRow is one entry of the admin-curated StarGift storefront.
+// Auction/collectible fields are deliberately absent -- see
+// cmd/telesrv-admin/readstore.go's StarGiftCatalogRow doc comment.
+export type StarGiftCatalogRow = {
+  GiftID: string;
+  Enabled: boolean;
+  SortOrder: number;
+  Revision: number;
+  Title: string;
+  Stars: string;
+  ConvertStars: string;
+  DocumentID: string;
+  SourceFormat: string;
+  Width: number;
+  Height: number;
+  Limited: boolean;
+  SoldOut: boolean;
+  Birthday: boolean;
+  RequirePremium: boolean;
+  AvailabilityTotal: number;
+  AvailabilityRemains: number;
+  Auction: boolean;
+  ReceivedCount: string;
+  CreatedAt: string;
+  UpdatedAt: string;
+};
+
+export type StarGiftCatalogListResponse = { rows: StarGiftCatalogRow[] };
+
+export type StarGiftCollectibleAttributeRow = {
+  id: string;
+  kind: "model" | "pattern" | "backdrop";
+  name: string;
+  rarity_kind: "permille" | "uncommon" | "rare" | "epic" | "legendary";
+  rarity_permille: number;
+  crafted: boolean;
+  official_document_id: string;
+  sort_order: number;
+  source_name?: string;
+  source_format?: "tgs" | "lottie";
+  backdrop_id?: number;
+  center_color?: number;
+  edge_color?: number;
+  pattern_color?: number;
+  text_color?: number;
+};
+
+export type StarGiftCollectiblePreview = {
+  found: boolean;
+  gift_id: string;
+  revision?: number;
+  upgrade_stars?: string;
+  supply_total?: number;
+  issued?: number;
+  slug_prefix?: string;
+  models?: StarGiftCollectibleAttributeRow[];
+  patterns?: StarGiftCollectibleAttributeRow[];
+  backdrops?: StarGiftCollectibleAttributeRow[];
+};
+
+// GiftPack is one archive on the operator's shelf, rendered from its own
+// manifest. Uploading a pack does not put anything in the catalog: these are
+// previewable, and importable whole or one gift at a time.
+export type GiftPack = {
+  id: string;
+  name: string;
+  author: string;
+  description: string;
+  icon: string;
+  gifts: GiftPackGift[];
+};
+
+export type GiftPackAttr = { id: string; name: string; permille: number; rarity?: string };
+
+export type GiftPackGift = {
+  slug: string;
+  title: string;
+  stars: number;
+  convert_stars: number;
+  flags: string[];
+  upgrade?: {
+    stars: number;
+    supply: number;
+    models: GiftPackAttr[];
+    patterns: GiftPackAttr[];
+    backdrops: { name: string; center: string; edge: string; pattern: string; text: string; permille: number }[];
+  };
+};
+
+export type AccountListResponse = {
+  query: string;
+  limit: number;
+  rows: AccountRow[];
+  has_more: boolean;
+  next_before_id: number;
+  next_before_active_us: number;
+  listing: boolean;
+};
+
+export type AccountStatsResponse = {
+  total: number;
+  online: number;
+  // How many accounts each list filter matches across the whole server.
+  filters?: { premium: number; verified: number; frozen: number; has_email: number };
+};
+
+// SharedDeviceAccount is one account whose authorizations matched a
+// SharedDeviceGroup's device fingerprint.
+export type SharedDeviceAccount = {
+  UserID: number;
+  Phone: string;
+  Username: string;
+  FirstName: string;
+  LastName: string;
+  ActiveAt: string;
+};
+
+// SharedDeviceGroup is a device fingerprint (device model + OS + platform +
+// IP) shared by more than one distinct account -- a heuristic multi-account
+// signal, not proof (device_model/system_version are client-reported and
+// spoofable, and IP alone collides behind NAT/shared wifi/carrier CGNAT).
+export type SharedDeviceGroup = {
+  DeviceModel: string;
+  SystemVersion: string;
+  Platform: string;
+  IP: string;
+  AccountCount: number;
+  LastActiveAt: string;
+  Accounts: SharedDeviceAccount[];
+};
+
+export type SharedDeviceGroupListResponse = {
+  limit: number;
+  offset: number;
+  rows: SharedDeviceGroup[];
+  has_more: boolean;
+  next_offset: number;
+};
+
+export type StorageStatsResponse = {
+  PhysicalBytes: string;
+  LogicalBytes: string;
+  SystemBytes: string;
+  DocumentCount: string;
+  PhotoCount: string;
+  AccountCount: string;
+  BackendKind: string;
+};
+
+export type DashboardCounts = {
+  Users: number;
+  OnlineUsers: number;
+  Bots: number;
+  BroadcastChannels: number;
+  Supergroups: number;
+  StickerSets: number;
+  EmojiSets: number;
+  Gifs: number;
+  PendingReports: number;
+  PendingVerifications: number;
+};
+
+export type HostStatsSnapshot = {
+  CPUPercent: number;
+  MemUsedBytes: number;
+  MemTotalBytes: number;
+  DiskFreeBytes: number;
+  DiskTotalBytes: number;
+  // False when the disk-space sample itself failed (wrong path, not
+  // created yet, etc) -- DiskFreeBytes/DiskTotalBytes are stale/zero in
+  // that case, not "the disk is actually full". Independent of Ready,
+  // which only covers CPU/memory.
+  DiskReady: boolean;
+  Ready: boolean;
+};
+
+export type HostSample = {
+  t: number;
+  cpu: number;
+  mem: number;
+};
+
+export type DashboardResponse = {
+  counts: DashboardCounts;
+  storage: StorageStatsResponse;
+  host?: HostStatsSnapshot;
+  // The last ~15 minutes of host samples, oldest first; empty after a restart.
+  host_history?: HostSample[];
+  update?: { available: boolean; latest?: string; url?: string; notes?: string };
+};
+
+export type DayActivity = {
+  date: string;
+  new_users: number;
+  messages: number;
+};
+
+export type DashboardActivity = {
+  days: DayActivity[];
+  active_day: number;
+  active_week: number;
+  active_month: number;
+};
+
+export type AccountStorageRow = {
+  UserID: string;
+  Username: string;
+  FirstName: string;
+  Bytes: string;
+  FileCount: string;
+};
+
+export type AccountStorageListResponse = {
+  rows: AccountStorageRow[] | null;
+  has_more: boolean;
+  next_offset: number;
+};
+
+export type ChannelListResponse = {
+  query: string;
+  limit: number;
+  rows: ChannelRow[];
+  has_more: boolean;
+  next_before_id: number;
+  next_before_updated_us: number;
+  listing: boolean;
+  // How many chats each list filter matches across the whole server.
+  filter_counts?: { channels: number; groups: number; verified: number };
+};
+
+export type BotListResponse = {
+  query: string;
+  limit: number;
+  rows: BotRow[];
+  has_more: boolean;
+  next_before_id: number;
+  listing: boolean;
+  // How many bots each list filter matches across the whole server.
+  filter_counts?: { verified: number; system: number; user: number };
+};
+
+export type BroadcastRow = {
+  ID: number;
+  Message: string;
+  TargetMode: string;
+  TargetCount: number;
+  MaterializedCount: number;
+  SentCount: number;
+  FailedCount: number;
+  EnumerationDone: boolean;
+  CreatedBy: string;
+  CreatedAt: string;
+};
+
+export type BroadcastListResponse = {
+  limit: number;
+  rows: BroadcastRow[];
+  has_more: boolean;
+  next_before_id: number;
+};
+
+export type EmojiRow = {
+  DocumentID: string;
+  Alt: string;
+  MimeType: string;
+  Size: number;
+  SetTitle: string;
+  CreatedAt: string;
+};
+
+export type EmojiListResponse = {
+  query: string;
+  rows: EmojiRow[];
+  has_more: boolean;
+  next_before_id: number;
+  listing: boolean;
+};
+
+export type MessageListResponse = {
+  owner_user_id: number;
+  peer_id: number;
+  before_date: number;
+  before_id: number;
+  limit: number;
+  rows: MessageRow[];
+};
+
+export type GroupMessageListResponse = {
+  channel_id: number;
+  before_date: number;
+  before_id: number;
+  limit: number;
+  rows: GroupMessageRow[];
+};
+
+export type ServerIdentity = {
+  name: string;
+  description: string;
+  icon_ext?: string;
+  // welcome_message_*_template: raw admin-panel override for the 777000
+  // login-notification message, empty when unset (falls back to the
+  // TELESRV_WELCOME_MESSAGE_*_TEMPLATE env var, then a built-in default).
+  welcome_message_phone_template?: string;
+  welcome_message_email_template?: string;
+  // default_welcome_message_*_template: the effective fallback text this
+  // admin process currently reads (env var if set, else the compiled-in
+  // copy) -- shown when the override above is empty.
+  default_welcome_message_phone_template: string;
+  default_welcome_message_email_template: string;
+  // login_code_message_template: raw admin-panel override for the 777000
+  // login-code delivery message, empty when unset (falls back to the
+  // TELESRV_LOGIN_CODE_MESSAGE_TEMPLATE env var, then a built-in default).
+  // Unlike the welcome_message_* templates there is only one -- the
+  // message never varies by delivery channel. Must contain the {{code}}
+  // placeholder exactly once (enforced server-side on save).
+  login_code_message_template?: string;
+  // default_login_code_message_template: the effective fallback text this
+  // admin process currently reads -- shown when the override above is empty.
+  default_login_code_message_template: string;
+};
+
+export type EnvField = {
+  key: string;
+  default_value: string;
+  description: string;
+  enabled_by_default: boolean;
+  sensitive: boolean;
+  value: string;
+};
+
+export type EnvGroup = {
+  title: string;
+  description: string;
+  fields: EnvField[];
+};
+
+export type ServerStatus = {
+  CtlPID: number;
+  CtlAlive: boolean;
+  ServerPID: number;
+  ServerAlive: boolean;
+  AdminPID: number;
+  AdminAlive: boolean;
+};
+
+// Where PostgreSQL and uploaded media live -- the first-run wizard's storage
+// step. Mirrors storageSettings in cmd/telesrv-admin/serverstorage.go.
+export type StorageSettings = {
+  postgres_mode: "embedded" | "external";
+  // The stored connection string with its password shown as ****.
+  postgres_dsn: string;
+  embedded_dir: string;
+  blob_backend: "localfs" | "s3";
+  blob_dir: string;
+  s3_endpoint: string;
+  s3_bucket: string;
+  s3_region: string;
+  s3_access_key_id: string;
+  // Only ever sent to the server, never returned.
+  s3_secret_access_key?: string;
+  s3_secret_set: boolean;
+  s3_use_ssl: boolean;
+  s3_path_style: boolean;
+  s3_create_bucket: boolean;
+  configured: boolean;
+};
+
+export type ServerStartupLog = {
+  // The currently launching fluxgram-server's own log lines, from its
+  // startup marker onward. Null/empty before the log file exists yet.
+  lines: string[] | null;
+};
+
+// One admin console operator. Mirrors AdminConsoleUser in adminusers.go; the
+// password hash deliberately has no representation here.
+export type AdminConsoleUser = {
+  id: number;
+  username: string;
+  permissions: string[];
+  enabled: boolean;
+  token_epoch: number;
+  created_at: string;
+  updated_at: string;
+  last_login_at?: string | null;
+};
+
+// The built-in operator backed by TELESRV_ADMIN_UI_PASSWORD / _TOKEN. It has no
+// database row, so it carries no id and cannot be edited from the panel.
+export type AdminConsoleSystemOperator = {
+  username: string;
+  permissions: string[];
+  enabled: boolean;
+  system: true;
+};
+
+export type AdminConsoleUserList = {
+  system?: AdminConsoleSystemOperator;
+  rows: AdminConsoleUser[];
+  // The rights the server is willing to assign, so the editor cannot drift
+  // from what the routes actually enforce.
+  available_permissions: string[];
+};
+
+
+// The two branding fields the login screen may read without a session.
+export type PublicBranding = {
+  name: string;
+  has_icon: boolean;
+};
