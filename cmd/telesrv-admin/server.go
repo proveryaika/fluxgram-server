@@ -1,0 +1,3069 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/subtle"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"mime/multipart"
+	"net/http"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/fluxgram/fluxgram-td/tg"
+	"github.com/fluxgram/fluxgram-td/tlprofile"
+	"golang.org/x/sync/errgroup"
+
+	"telesrv/internal/admin"
+	"telesrv/internal/domain"
+	"telesrv/internal/hoststats"
+	"telesrv/internal/identity"
+	"telesrv/internal/procctl"
+	"telesrv/internal/updatecheck"
+	"telesrv/internal/version"
+)
+
+//go:embed web/dist
+var webDist embed.FS
+
+type server struct {
+	cfg       uiConfig
+	read      *readStore
+	hostStats *hoststats.Poller
+	web       fs.FS
+	webServer http.Handler
+	identity  *identity.Store
+	serverCtl *procctl.Manager
+	// updates remembers whether GitHub has a newer server release; see
+	// internal/updatecheck. Run by main, read by the session payload.
+	updates *updatecheck.Checker
+	// stats answers the overview/Storage aggregates from memory; see
+	// statscache.go. nil without a read store.
+	stats *statsCaches
+}
+
+func newServer(cfg uiConfig, read *readStore, hostStats *hoststats.Poller) (*server, error) {
+	web, err := fs.Sub(webDist, "web/dist")
+	if err != nil {
+		return nil, err
+	}
+	return &server{
+		cfg:       cfg,
+		read:      read,
+		hostStats: hostStats,
+		web:       web,
+		webServer: http.FileServer(http.FS(web)),
+		identity:  identity.NewStore(cfg.IdentityDir),
+		serverCtl: procctl.NewManager(cfg.RepoRoot),
+		updates:   updatecheck.New(cfg.UpdateCheckEnabled, version.Release, ""),
+		stats:     newStatsCaches(read),
+	}, nil
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/login", s.handleAPILogin)
+	// Logout goes through the same gate as every other mutating route: a forced
+	// logout is a state change, and an invalid session is cleared by the gate
+	// itself, so nothing is stranded by protecting it.
+	mux.Handle("POST /api/logout", s.scopedRoute(permissionSessionOnly, http.HandlerFunc(s.handleAPILogout)))
+	// Unauthenticated on purpose: the login screen shows which server it is,
+	// and the name/icon are already public from fluxgram-server's own client
+	// endpoints. See publicbranding.go.
+	mux.HandleFunc("GET /api/public/branding", s.handlePublicBrandingAPI)
+	mux.HandleFunc("GET /api/public/icon", s.handlePublicIconAPI)
+
+	mux.Handle("GET /api/session", s.scopedRoute(permissionSessionOnly, http.HandlerFunc(s.handleSession)))
+
+	// Operator accounts. Every one of these is gated on admins.manage -- the
+	// right that can hand out every other right -- so they are registered
+	// together rather than scattered among the domain routes.
+	mux.Handle("GET /api/admin-users", s.requireAdminsManage(http.HandlerFunc(s.handleListAdminUsersAPI)))
+	// Mutations live under /api/actions/* like every other command in the
+	// panel, so they get the same reason + dry-run + confirm flow.
+	mux.Handle("POST /api/actions/create-admin-operator", s.requireAdminsManage(http.HandlerFunc(s.handleCreateAdminUserAPI)))
+	mux.Handle("POST /api/actions/set-admin-operator-access", s.requireAdminsManage(http.HandlerFunc(s.handleUpdateAdminUserAPI)))
+	mux.Handle("POST /api/actions/set-admin-operator-password", s.requireAdminsManage(http.HandlerFunc(s.handleSetAdminUserPasswordAPI)))
+	mux.Handle("GET /api/dashboard", s.scopedRoute(permissionDashboardRead, http.HandlerFunc(s.handleDashboardAPI)))
+	mux.Handle("GET /api/dashboard/activity", s.scopedRoute(permissionDashboardRead, http.HandlerFunc(s.handleDashboardActivityAPI)))
+	mux.Handle("GET /api/audit-logs", s.scopedRoute(permissionAuditRead, http.HandlerFunc(s.handleAuditLogsAPI)))
+	mux.Handle("GET /api/account-ratings", s.scopedRoute(permissionRatingsRead, http.HandlerFunc(s.handleAccountRatingsAPI)))
+	mux.Handle("GET /api/account-ratings/{user_id}", s.scopedRoute(permissionRatingsRead, http.HandlerFunc(s.handleAccountRatingDetailAPI)))
+	mux.Handle("GET /api/star-gift-catalog", s.scopedRoute(permissionStarGiftsRead, http.HandlerFunc(s.handleStarGiftCatalogAPI)))
+	mux.Handle("GET /api/star-gift-catalog/{gift_id}/animation", s.scopedRoute(permissionStarGiftsRead, http.HandlerFunc(s.handleStarGiftCatalogAnimationAPI)))
+	mux.Handle("GET /api/star-gift-catalog/{gift_id}/collectibles", s.scopedRoute(permissionStarGiftsRead, http.HandlerFunc(s.handleStarGiftCollectiblesAPI)))
+	mux.Handle("GET /api/star-gift-catalog/{gift_id}/collectibles/{kind}/{attribute_id}/animation", s.scopedRoute(permissionStarGiftsRead, http.HandlerFunc(s.handleStarGiftCollectibleAnimationAPI)))
+	mux.Handle("GET /api/gift-packs", s.scopedRoute(permissionStarGiftsRead, http.HandlerFunc(s.handleGiftPacksAPI)))
+	mux.Handle("GET /api/gift-packs/{pack_id}/animations/{slug}", s.scopedRoute(permissionStarGiftsRead, http.HandlerFunc(s.handleGiftPackAnimationAPI)))
+	mux.Handle("GET /api/accounts", s.scopedRoute(permissionAccountsRead, http.HandlerFunc(s.handleAccountsAPI)))
+	mux.Handle("GET /api/accounts/stats", s.scopedRoute(permissionAccountsRead, http.HandlerFunc(s.handleAccountsStatsAPI)))
+	mux.Handle("GET /api/accounts/shared-devices", s.scopedRoute(permissionAccountsRead, http.HandlerFunc(s.handleSharedDeviceGroupsAPI)))
+	mux.Handle("GET /api/broadcasts", s.scopedRoute(permissionBroadcastsRead, http.HandlerFunc(s.handleBroadcastsAPI)))
+	mux.Handle("GET /api/accounts/{id}", s.scopedRoute(permissionAccountsRead, http.HandlerFunc(s.handleAccountDetailAPI)))
+	mux.Handle("GET /api/accounts/{id}/avatar", s.scopedRoute(permissionAccountsRead, http.HandlerFunc(s.handleAccountAvatarAPI)))
+	mux.Handle("GET /api/channels", s.scopedRoute(permissionChannelsRead, http.HandlerFunc(s.handleChannelsAPI)))
+	mux.Handle("GET /api/channels/{id}", s.scopedRoute(permissionChannelsRead, http.HandlerFunc(s.handleChannelDetailAPI)))
+	mux.Handle("GET /api/channels/{id}/avatar", s.scopedRoute(permissionChannelsRead, http.HandlerFunc(s.handleChannelAvatarAPI)))
+	mux.Handle("GET /api/bots", s.scopedRoute(permissionBotsRead, http.HandlerFunc(s.handleBotsAPI)))
+	mux.Handle("GET /api/bots/{id}", s.scopedRoute(permissionBotsRead, http.HandlerFunc(s.handleBotDetailAPI)))
+	mux.Handle("GET /api/emoji", s.scopedRoute(permissionContentRead, http.HandlerFunc(s.handleEmojiAPI)))
+	mux.Handle("GET /api/emoji/{id}/animation", s.scopedRoute(permissionContentRead, http.HandlerFunc(s.handleEmojiAnimationAPI)))
+	// Raw message rows sit behind the same password re-check as the viewer.
+	mux.Handle("GET /api/messages", s.scopedRoute(permissionMessagesRead, s.requireViewGrantForQuery("user", "owner_user_id", s.handleMessagesAPI)))
+	mux.Handle("GET /api/messages/detail", s.scopedRoute(permissionMessagesRead, s.requireViewGrantForQuery("user", "owner_user_id", s.handleMessageDetailAPI)))
+	mux.Handle("GET /api/messages/groups", s.scopedRoute(permissionMessagesRead, s.requireViewGrantForQuery("channel", "channel_id", s.handleGroupMessagesAPI)))
+	mux.Handle("GET /api/messages/groups/detail", s.scopedRoute(permissionMessagesRead, s.requireViewGrantForQuery("channel", "channel_id", s.handleGroupMessageDetailAPI)))
+	s.registerPrivateViewRoutes(mux)
+	mux.Handle("GET /api/collectible-usernames", s.scopedRoute(permissionUsernamesRead, http.HandlerFunc(s.handleCollectibleUsernamesAPI)))
+	mux.Handle("GET /api/collectible-usernames/{id}", s.scopedRoute(permissionUsernamesRead, http.HandlerFunc(s.handleCollectibleUsernameDetailAPI)))
+	mux.Handle("GET /api/storage/stats", s.scopedRoute(permissionStorageRead, http.HandlerFunc(s.handleStorageStatsAPI)))
+	mux.Handle("GET /api/storage/accounts", s.scopedRoute(permissionStorageRead, http.HandlerFunc(s.handleStorageAccountsAPI)))
+	mux.Handle("GET /api/moderation/cases", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleModerationCasesAPI)))
+	mux.Handle("GET /api/moderation/cases/{id}", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleModerationCaseAPI)))
+	mux.Handle("GET /api/moderation/reports/{id}", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleModerationReportAPI)))
+	mux.Handle("GET /api/moderation/reports/{id}/evidence", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleModerationReportEvidenceAPI)))
+	mux.Handle("GET /api/moderation/reports/{id}/media", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleModerationReportMediaAPI)))
+	mux.Handle("POST /api/moderation/cases/{id}/claim", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleClaimModerationCaseAPI)))
+	mux.Handle("POST /api/moderation/cases/{id}/decide", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleDecideModerationCaseAPI)))
+	mux.Handle("POST /api/moderation/cases/{id}/appeals/{appeal_id}/review", s.scopedRoute(permissionModerationReview, http.HandlerFunc(s.handleReviewModerationAppealAPI)))
+	mux.Handle("POST /api/actions/set-frozen", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetAccountFrozenAPI)))
+	mux.Handle("POST /api/actions/grant-premium", s.scopedRoute(permissionPremiumManage, http.HandlerFunc(s.handleGrantPremiumAPI)))
+	mux.Handle("POST /api/actions/grant-stars", s.scopedRoute(permissionPremiumManage, http.HandlerFunc(s.handleGrantStarsAPI)))
+	mux.Handle("GET /api/premium/plans", s.scopedRoute(permissionPremiumManage, http.HandlerFunc(s.handlePremiumPlansAPI)))
+	mux.Handle("GET /api/premium/payments/{id}", s.scopedRoute(permissionPremiumManage, http.HandlerFunc(s.handlePremiumPaymentAPI)))
+	mux.Handle("POST /api/actions/premium-upsert-plan", s.scopedRoute(permissionPremiumManage, http.HandlerFunc(s.handleUpsertPremiumPlanAPI)))
+	mux.Handle("POST /api/actions/premium-refund", s.scopedRoute(permissionPremiumManage, http.HandlerFunc(s.handleRefundPremiumAPI)))
+	mux.Handle("GET /api/donations/wallet", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDonationWalletStatusAPI)))
+	mux.Handle("GET /api/donations/chains", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDonationChainsAPI)))
+	mux.Handle("GET /api/donations/deposits", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDonationDepositsAPI)))
+	mux.Handle("POST /api/actions/donation-chain-update", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleUpdateDonationChainAPI)))
+	mux.Handle("POST /api/actions/donation-chain-create", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleCreateDonationChainAPI)))
+	mux.Handle("POST /api/actions/donation-chain-delete", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDeleteDonationChainAPI)))
+	mux.Handle("POST /api/actions/donation-sweep", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleSweepDonationChainAPI)))
+	mux.Handle("POST /api/actions/donation-token-upsert", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleUpsertDonationTokenAPI)))
+	mux.Handle("POST /api/actions/donation-token-delete", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDeleteDonationTokenAPI)))
+	mux.Handle("GET /api/donations/settings", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDonationSettingsAPI)))
+	mux.Handle("GET /api/donations/price-preview", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDonationPricePreviewAPI)))
+	mux.Handle("GET /api/donations/chains/{key}/balance", s.scopedRoute(permissionDonationsManage, s.requireDonationsVisible(s.handleDonationChainBalanceAPI)))
+	mux.Handle("POST /api/actions/recompute-account-rating", s.scopedRoute(permissionRatingsManage, http.HandlerFunc(s.handleRecomputeAccountRatingAPI)))
+	mux.Handle("POST /api/actions/adjust-account-rating", s.scopedRoute(permissionRatingsManage, http.HandlerFunc(s.handleAdjustAccountRatingAPI)))
+	mux.Handle("POST /api/actions/set-verified", s.scopedRoute(permissionVerificationReview, http.HandlerFunc(s.handleSetVerifiedAPI)))
+	mux.Handle("POST /api/actions/set-account-flags", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetUserFlagsAPI)))
+	mux.Handle("POST /api/actions/set-channel-flags", s.scopedRoute(permissionChannelsManage, http.HandlerFunc(s.handleSetChannelFlagsAPI)))
+	mux.Handle("POST /api/actions/set-support", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetSupportAPI)))
+	mux.Handle("POST /api/actions/set-account-username", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetUsernameAPI)))
+	mux.Handle("POST /api/actions/set-account-profile", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetProfileAPI)))
+	mux.Handle("POST /api/actions/set-account-phone", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetPhoneAPI)))
+	mux.Handle("POST /api/actions/set-account-avatar", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetAccountAvatarAPI)))
+	mux.Handle("POST /api/actions/set-account-avatar-video", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetAccountAvatarVideoAPI)))
+	mux.Handle("POST /api/actions/set-account-login-email", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetLoginEmailAPI)))
+	mux.Handle("POST /api/actions/set-account-color", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetUserColorAPI)))
+	mux.Handle("POST /api/actions/set-account-emoji-status", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetUserEmojiStatusAPI)))
+	mux.Handle("POST /api/actions/set-channel-avatar", s.scopedRoute(permissionChannelsManage, http.HandlerFunc(s.handleSetChannelAvatarAPI)))
+	mux.Handle("POST /api/actions/set-channel-settings", s.scopedRoute(permissionChannelsManage, http.HandlerFunc(s.handleSetChannelSettingsAPI)))
+	mux.Handle("POST /api/actions/set-channel-username", s.scopedRoute(permissionChannelsManage, http.HandlerFunc(s.handleSetChannelUsernameAPI)))
+	mux.Handle("POST /api/actions/set-channel-color", s.scopedRoute(permissionChannelsManage, http.HandlerFunc(s.handleSetChannelColorAPI)))
+	mux.Handle("POST /api/actions/set-channel-emoji-status", s.scopedRoute(permissionChannelsManage, http.HandlerFunc(s.handleSetChannelEmojiStatusAPI)))
+	mux.Handle("POST /api/actions/create-bot", s.scopedRoute(permissionBotsManage, http.HandlerFunc(s.handleCreateBotAPI)))
+	mux.Handle("POST /api/actions/create-broadcast", s.scopedRoute(permissionBroadcastsSend, http.HandlerFunc(s.handleCreateBroadcastAPI)))
+	mux.Handle("POST /api/actions/delete-bot", s.scopedRoute(permissionBotsManage, http.HandlerFunc(s.handleDeleteBotAPI)))
+	mux.Handle("POST /api/actions/export-bot-token", s.scopedRoute(permissionBotTokenRead, http.HandlerFunc(s.handleExportBotTokenAPI)))
+	mux.Handle("POST /api/actions/set-channel-verified", s.scopedRoute(permissionVerificationReview, http.HandlerFunc(s.handleSetChannelVerifiedAPI)))
+	mux.Handle("POST /api/actions/revoke-sessions", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleRevokeSessionsAPI)))
+	mux.Handle("POST /api/actions/delete-messages", s.scopedRoute(permissionMessagesManage, http.HandlerFunc(s.handleDeleteMessagesAPI)))
+	mux.Handle("POST /api/actions/delete-history", s.scopedRoute(permissionMessagesManage, http.HandlerFunc(s.handleDeleteHistoryAPI)))
+	mux.Handle("GET /api/stickers", s.scopedRoute(permissionContentRead, http.HandlerFunc(s.handleStickerSetsAPI)))
+	mux.Handle("GET /api/stickers/{id}/documents", s.scopedRoute(permissionContentRead, http.HandlerFunc(s.handleStickerSetDocumentsAPI)))
+	mux.Handle("GET /api/stickers/documents/{id}/animation", s.scopedRoute(permissionContentRead, http.HandlerFunc(s.handleStickerDocumentAnimationAPI)))
+	mux.Handle("GET /api/gif-catalog/documents/{id}/preview", s.scopedRoute(permissionContentRead, http.HandlerFunc(s.handleGifCatalogDocumentPreviewAPI)))
+	mux.Handle("POST /api/actions/set-sticker-set-archived", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetStickerSetArchivedAPI)))
+	mux.Handle("POST /api/actions/set-sticker-set-sort-order", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetStickerSetSortOrderAPI)))
+	mux.Handle("POST /api/actions/rename-sticker-set", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleRenameStickerSetAPI)))
+	mux.Handle("POST /api/actions/delete-sticker-set", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleDeleteStickerSetAPI)))
+	mux.Handle("POST /api/actions/create-sticker-set", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleCreateStickerSetAPI)))
+	mux.Handle("POST /api/actions/add-sticker-to-set", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleAddStickerToSetAPI)))
+	mux.Handle("POST /api/actions/remove-sticker-from-set", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleRemoveStickerFromSetAPI)))
+	mux.Handle("GET /api/gif-catalog", s.scopedRoute(permissionContentRead, http.HandlerFunc(s.handleGifCatalogAPI)))
+	mux.Handle("POST /api/actions/create-gif-catalog-entry", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleCreateGifCatalogEntryAPI)))
+	mux.Handle("POST /api/actions/create-star-gift-catalog-entry", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handleCreateStarGiftCatalogEntryAPI)))
+	mux.Handle("POST /api/actions/set-star-gift-catalog-enabled", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handleSetStarGiftCatalogEnabledAPI)))
+	mux.Handle("POST /api/actions/set-star-gift-catalog-sort-order", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handleSetStarGiftCatalogSortOrderAPI)))
+	mux.Handle("POST /api/actions/publish-star-gift-collectibles", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handlePublishStarGiftCollectiblesAPI)))
+	mux.Handle("POST /api/actions/give-star-gift", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handleGiveStarGiftAPI)))
+	mux.Handle("POST /api/actions/upload-gift-pack", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handleUploadGiftPackAPI)))
+	mux.Handle("POST /api/actions/delete-gift-pack", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handleDeleteGiftPackAPI)))
+	mux.Handle("POST /api/actions/import-gift-pack", s.scopedRoute(permissionStarGiftsManage, http.HandlerFunc(s.handleImportGiftPackAPI)))
+	mux.Handle("POST /api/actions/set-gif-catalog-enabled", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetGifCatalogEnabledAPI)))
+	mux.Handle("POST /api/actions/set-gif-catalog-sort-order", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetGifCatalogSortOrderAPI)))
+	mux.Handle("POST /api/actions/set-gif-catalog-category", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleSetGifCatalogCategoryAPI)))
+	mux.Handle("POST /api/actions/auto-categorize-gif-catalog", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleAutoCategorizeGifCatalogAPI)))
+	mux.Handle("POST /api/actions/delete-uncategorized-gifs", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleDeleteUncategorizedGifsAPI)))
+	mux.Handle("POST /api/actions/storage-manual-purge", s.scopedRoute(permissionStorageManage, http.HandlerFunc(s.handleStorageManualPurgeAPI)))
+	mux.Handle("POST /api/actions/delete-gif-catalog-entry", s.scopedRoute(permissionContentManage, http.HandlerFunc(s.handleDeleteGifCatalogEntryAPI)))
+	mux.Handle("POST /api/actions/mint-collectible-username", s.scopedRoute(permissionUsernamesManage, http.HandlerFunc(s.handleMintCollectibleUsernameAPI)))
+	mux.Handle("POST /api/actions/transfer-collectible-username", s.scopedRoute(permissionUsernamesManage, http.HandlerFunc(s.handleTransferCollectibleUsernameAPI)))
+	mux.Handle("POST /api/actions/revoke-collectible-username", s.scopedRoute(permissionUsernamesManage, http.HandlerFunc(s.handleRevokeCollectibleUsernameAPI)))
+	mux.Handle("POST /api/actions/delete-collectible-username", s.scopedRoute(permissionUsernamesManage, http.HandlerFunc(s.handleDeleteCollectibleUsernameAPI)))
+	// Official platform verification. Every route needs verification.review;
+	// clearing an existing badge needs verification.revoke on top of it.
+	mux.Handle("GET /api/verification/applications", s.verificationRead(s.handleVerificationApplicationsAPI))
+	mux.Handle("GET /api/verification/applications/{id}", s.verificationRead(s.handleVerificationApplicationDetailAPI))
+	mux.Handle("GET /api/verification/counts", s.verificationRead(s.handleVerificationCountsAPI))
+	mux.Handle("POST /api/verification/applications/{id}/claim", s.verificationRead(s.handleClaimVerificationAPI))
+	mux.Handle("POST /api/verification/applications/{id}/approve", s.verificationRead(s.handleApproveVerificationAPI))
+	mux.Handle("POST /api/verification/applications/{id}/reject", s.verificationRead(s.handleRejectVerificationAPI))
+	mux.Handle("POST /api/actions/revoke-verification", s.scopedRouteAll(
+		[]string{permissionVerificationReview, permissionVerificationRevoke},
+		http.HandlerFunc(s.handleRevokeVerificationAPI)))
+	// Third-party bot verification. A separate section from the official
+	// verification block above -- separate tables, separate rights, separate routes.
+	// Reads and queue decisions need botverification.review; appointing verifiers,
+	// curating the icon catalogue and stripping a granted mark need
+	// botverification.manage.
+	mux.Handle("GET /api/botverification/verifiers", s.botVerificationRead(s.handleBotVerifiersAPI))
+	mux.Handle("GET /api/botverification/icons", s.botVerificationRead(s.handleVerificationIconsAPI))
+	mux.Handle("GET /api/botverification/marks", s.botVerificationRead(s.handleCustomVerificationsAPI))
+	mux.Handle("GET /api/botverification/requests", s.botVerificationRead(s.handleCustomVerificationRequestsAPI))
+	mux.Handle("GET /api/botverification/requests/{id}", s.botVerificationRead(s.handleCustomVerificationRequestDetailAPI))
+	mux.Handle("GET /api/botverification/counts", s.botVerificationRead(s.handleCustomVerificationCountsAPI))
+	mux.Handle("POST /api/botverification/requests/{id}/approve", s.botVerificationRead(s.handleApproveBotVerificationAPI))
+	mux.Handle("POST /api/botverification/requests/{id}/reject", s.botVerificationRead(s.handleRejectBotVerificationAPI))
+	mux.Handle("POST /api/botverification/requests/{id}/revoke", s.botVerificationRead(s.handleRevokeBotVerificationAPI))
+	mux.Handle("POST /api/actions/grant-bot-verifier", s.botVerificationManage(s.handleGrantBotVerifierAPI))
+	mux.Handle("POST /api/actions/set-bot-verifier-enabled", s.botVerificationManage(s.handleSetBotVerifierEnabledAPI))
+	mux.Handle("POST /api/actions/revoke-bot-verifier", s.botVerificationManage(s.handleRevokeBotVerifierAPI))
+	mux.Handle("POST /api/actions/upsert-verification-icon", s.botVerificationManage(s.handleUpsertVerificationIconAPI))
+	mux.Handle("POST /api/actions/set-verification-icon-active", s.botVerificationManage(s.handleSetVerificationIconActiveAPI))
+	mux.Handle("POST /api/actions/revoke-custom-verification", s.botVerificationManage(s.handleRevokeCustomVerificationAPI))
+	// Server Settings -- see serversettings.go. Everything here operates
+	// directly on local files/processes (no RPC hop to fluxgram-server's
+	// in-process admin API), so it works even for actions (Restart/Update)
+	// that fluxgram-server could never safely perform on itself.
+	mux.Handle("GET /api/server/identity", s.serverManage(s.handleServerIdentityAPI))
+	mux.Handle("GET /api/server/add-server-link", s.serverManage(s.handleAddServerLinkAPI))
+	mux.Handle("GET /api/server/icon", s.serverManage(s.handleServerIconAPI))
+	mux.Handle("POST /api/actions/set-server-identity", s.serverManage(s.handleSetServerIdentityAPI))
+	mux.Handle("POST /api/actions/set-welcome-message-templates", s.serverManage(s.handleSetWelcomeMessageTemplatesAPI))
+	mux.Handle("POST /api/actions/set-login-code-message-template", s.serverManage(s.handleSetLoginCodeMessageTemplateAPI))
+	mux.Handle("POST /api/actions/upload-server-icon", s.serverManage(s.handleUploadServerIconAPI))
+	mux.Handle("POST /api/actions/remove-server-icon", s.serverManage(s.handleRemoveServerIconAPI))
+	mux.Handle("POST /api/actions/complete-setup", s.serverManage(s.handleCompleteSetupAPI))
+	mux.Handle("GET /api/server/env", s.serverManage(s.handleServerEnvAPI))
+	mux.Handle("POST /api/actions/update-server-env", s.serverManage(s.handleUpdateServerEnvAPI))
+	mux.Handle("GET /api/server/status", s.serverManage(s.handleServerStatusAPI))
+	mux.Handle("GET /api/server/startup-log", s.serverManage(s.handleServerStartupLogAPI))
+	mux.Handle("GET /api/server/storage", s.serverManage(s.handleServerStorageAPI))
+	mux.Handle("POST /api/actions/configure-storage", s.serverManage(s.handleConfigureStorageAPI))
+	mux.Handle("GET /api/server/check-updates", s.serverManage(s.handleCheckServerUpdatesAPI))
+	mux.Handle("POST /api/actions/restart-server", s.serverManage(s.handleRestartServerAPI))
+	mux.Handle("POST /api/actions/update-server", s.serverManage(s.handleUpdateServerAPI))
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) {
+		writeAPIError(w, http.StatusNotFound, "api route not found")
+	})
+	mux.HandleFunc("/", s.handleApp)
+	return mux
+}
+
+type actorKey struct{}
+
+func actorFromContext(ctx context.Context) string {
+	if actor, ok := ctx.Value(actorKey{}).(string); ok && actor != "" {
+		return actor
+	}
+	// requireAuthAPI always puts the actor in the context, so this is
+	// unreachable in practice. It returns a name that is obviously not a real
+	// operator rather than a plausible one: an audit line reading "admin" would
+	// silently attribute the action to somebody.
+	return "unknown"
+}
+
+func (s *server) handleApp(w http.ResponseWriter, r *http.Request) {
+	clean := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+	if clean != "." && clean != "" {
+		if info, err := fs.Stat(s.web, clean); err == nil && !info.IsDir() {
+			s.webServer.ServeHTTP(w, r)
+			return
+		}
+	}
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = "/"
+	s.webServer.ServeHTTP(w, r2)
+}
+
+type loginRequest struct {
+	// Username selects a named account in admin_console_users. Left empty, the
+	// credential is checked against TELESRV_ADMIN_UI_PASSWORD / _TOKEN instead,
+	// which keeps the pre-accounts login working and doubles as the way back in
+	// if the database is unreachable or every named account is locked out.
+	Username string `json:"username"`
+	Secret   string `json:"secret"`
+}
+
+// sessionTTL bounds a signed panel session and the CSRF cookie that goes with it,
+// so the two never outlive each other.
+const sessionTTL = 12 * time.Hour
+
+func (s *server) handleAPILogin(w http.ResponseWriter, r *http.Request) {
+	// Login is the one mutating route without a CSRF token, because no session
+	// exists yet to bind one to. The Origin check still applies, and the request
+	// carries the operator credential, which a forging page does not have.
+	if !sameOriginRequest(r) {
+		writeAPIError(w, http.StatusForbidden, "origin is not allowed")
+		return
+	}
+	var req loginRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	identity, ok := s.authenticateLogin(r.Context(), req)
+	if !ok {
+		// One message and one status for every failure mode -- unknown account,
+		// wrong password, disabled account. Saying which would let anyone with
+		// the login form enumerate operators.
+		writeAPIError(w, http.StatusUnauthorized, "invalid credential")
+		return
+	}
+	csrfToken, err := newCSRFToken()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	permissions := newPanelPermissions(identity.permissions)
+	value, err := signSession(s.cfg.SessionKey, sessionClaims{
+		Actor:       identity.actor,
+		UserID:      identity.userID,
+		Epoch:       identity.epoch,
+		Exp:         time.Now().Add(sessionTTL).Unix(),
+		Nonce:       newCommandID("sess"),
+		Permissions: permissions.List(),
+		CSRF:        csrfToken,
+	})
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    value,
+		Path:     "/",
+		MaxAge:   int(sessionTTL.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	setCSRFCookie(w, csrfToken, sessionTTL)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"actor":                         identity.actor,
+		"permissions":                   permissions.List(),
+		"csrf_token":                    csrfToken,
+		"hide_third_party_verification": s.cfg.HideThirdPartyVerification,
+		"donations_enabled":             s.cfg.DonationsEnabled,
+	})
+}
+
+func (s *server) validSecret(secret string) bool {
+	if s.cfg.Password != "" && subtle.ConstantTimeCompare([]byte(secret), []byte(s.cfg.Password)) == 1 {
+		// The password quickstart auto-generates for the very first login
+		// (see identity.Store.TemporaryPasswordMatches) is only good until
+		// the first-run wizard finishes -- one login's worth of "how do I
+		// even get in", not a credential anyone actually chose to keep
+		// around. A password an operator set on purpose, whether by saving
+		// one from Server Settings or editing .env by hand, never matches
+		// the stored generated value, so this never touches it.
+		if s.identity.TemporaryPasswordMatches(s.cfg.Password) && !s.identity.SetupPending() {
+			return false
+		}
+		return true
+	}
+	if s.cfg.Token != "" && subtle.ConstantTimeCompare([]byte(secret), []byte(s.cfg.Token)) == 1 {
+		return true
+	}
+	return false
+}
+
+func (s *server) handleAPILogout(w http.ResponseWriter, _ *http.Request) {
+	clearSessionCookie(w)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// supportedTLLayers returns every MTProto TL schema layer this server binary
+// can admit and encode for, oldest first. Probes tlprofile.ResolveProfile
+// (the vendored td package's registry) rather than hardcoding a range here,
+// so this stays correct as new profiles get added upstream without a
+// second place to remember to update. tg.Layer is always the newest one and
+// is included by construction, since ResolveProfile(tg.Layer) must succeed.
+func supportedTLLayers() []int {
+	var layers []int
+	for n := 1; n <= tg.Layer; n++ {
+		if _, ok := tlprofile.ResolveProfile(n); ok {
+			layers = append(layers, n)
+		}
+	}
+	return layers
+}
+
+// handleSession is what the panel asks on load. It reports the permissions the
+// session carries, so the UI can hide a section the operator may not use rather
+// than letting them walk into a 403.
+func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
+	build := currentBuildMetadata()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"actor":                         actorFromContext(r.Context()),
+		"permissions":                   permissionsFromContext(r.Context()).List(),
+		"hide_third_party_verification": s.cfg.HideThirdPartyVerification,
+		"donations_enabled":             s.cfg.DonationsEnabled,
+		// setup_completed gates the first-run wizard -- see
+		// identity.Store.SetupPending's doc comment for why this reads a
+		// sentinel file rather than anything in identity.json itself.
+		"setup_completed": !s.identity.SetupPending(),
+		// storage_configured/server_ready let the wizard continue where it
+		// left off after the storage step restarted the panel, and wait for
+		// the server it started before steps that need the database.
+		"storage_configured": s.serverCtl.StorageConfigured(),
+		"server_ready":       s.serverListening(),
+		// boot_id is random per process start (see main.go) -- Server
+		// Settings' Restart/Update flow polls this after triggering an
+		// action and reloads the page once it changes, which is how it
+		// tells "the old admin process died and a new one answered" apart
+		// from "the old one is just slow to respond".
+		"boot_id": bootID,
+		// api_layers is every MTProto TL schema layer this server binary can
+		// actually admit and encode for (see tlprofile.ResolveProfile in the
+		// vendored td package) -- the server is multi-layer (a client on an
+		// older supported layer still works, not just the newest one), so
+		// the sidebar shows the whole supported set, not just tg.Layer.
+		"api_layers": supportedTLLayers(),
+		// version is the release line this binary belongs to ("O8"); update
+		// is what the daily GitHub check found, so the sidebar can say a
+		// newer release is out. Both come from the binary, never the UI.
+		"version": version.Release,
+		"update":  s.updates.Snapshot(),
+		// build is this admin binary's own commit -- shown under "Version"
+		// in the sidebar footer so an operator can tell at a glance which
+		// build is actually running, independent of the app version string.
+		"build": map[string]any{
+			"commit":       build.Commit,
+			"short_commit": build.shortCommit(),
+			"dirty":        build.Dirty,
+			"build_time":   build.BuildTime,
+		},
+	})
+}
+
+// handleDashboardAPI backs the overview page: entity/queue counts from
+// Postgres, blob storage usage, and the last host CPU/RAM/disk sample (0/not
+// ready until the poller's first tick after startup).
+func (s *server) handleDashboardAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	// The two halves hit different tables and neither feeds the other, so the
+	// page waited for their sum for no reason. Storage in particular is the
+	// expensive one; running it alongside the counts means the response costs
+	// whichever is slower rather than both.
+	var (
+		counts  DashboardCounts
+		storage StorageStatsRow
+	)
+	g, gctx := errgroup.WithContext(r.Context())
+	g.Go(func() error {
+		var err error
+		counts, err = s.stats.dashboard.Get(gctx)
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		storage, err = s.stats.storage.Get(gctx)
+		return err
+	})
+	if err := g.Wait(); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp := map[string]any{
+		"counts":  counts,
+		"storage": storage,
+	}
+	if s.hostStats != nil {
+		resp["host"] = s.hostStats.Snapshot()
+		resp["host_history"] = s.hostStats.History()
+	}
+	// Also here, not only in the session payload: the session is read once at
+	// sign-in, and the first release check usually lands after that.
+	resp["update"] = s.updates.Snapshot()
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *server) handleEmojiAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	q := r.URL.Query().Get("q")
+	beforeID, _ := parseInt64(r.URL.Query().Get("before_id"))
+	limit, _ := parseInt(r.URL.Query().Get("limit"))
+	rows := []EmojiRow{}
+	hasMore := false
+	var err error
+	if strings.TrimSpace(q) != "" {
+		rows, err = s.read.SearchEmoji(r.Context(), q)
+	} else {
+		rows, hasMore, err = s.read.ListEmoji(r.Context(), beforeID, limit)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nextBeforeID := int64(0)
+	if hasMore && len(rows) > 0 {
+		nextBeforeID = rows[len(rows)-1].DocumentID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"query":          q,
+		"rows":           rows,
+		"has_more":       hasMore,
+		"next_before_id": nextBeforeID,
+		"listing":        strings.TrimSpace(q) == "",
+	})
+}
+
+func (s *server) handleEmojiAnimationAPI(w http.ResponseWriter, r *http.Request) {
+	documentID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || documentID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid document id")
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		fmt.Sprintf("%s/v1/emoji/%d/animation", s.cfg.AdminAPIURL, documentID), nil)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
+	if err != nil || len(raw) > 4<<20 {
+		writeAPIError(w, http.StatusBadGateway, "invalid animation response")
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		writeAPIError(w, resp.StatusCode, string(raw))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, max-age=60")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
+func (s *server) proxyAdminJSON(w http.ResponseWriter, r *http.Request, apiPath string, maxBytes int64) {
+	s.proxyAdminJSONWithCache(w, r, apiPath, maxBytes, "private, max-age=30")
+}
+
+func (s *server) proxyAdminJSONNoStore(w http.ResponseWriter, r *http.Request, apiPath string, maxBytes int64) {
+	s.proxyAdminJSONWithCache(w, r, apiPath, maxBytes, "no-store")
+}
+
+func (s *server) proxyAdminJSONWithCache(
+	w http.ResponseWriter,
+	r *http.Request,
+	apiPath string,
+	maxBytes int64,
+	cacheControl string,
+) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.cfg.AdminAPIURL+apiPath, nil)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil || int64(len(raw)) > maxBytes {
+		writeAPIError(w, http.StatusBadGateway, "invalid admin api response")
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeAPIError(w, resp.StatusCode, string(raw))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", cacheControl)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
+func (s *server) handleModerationCasesAPI(w http.ResponseWriter, r *http.Request) {
+	apiPath := "/v1/moderation/cases"
+	if r.URL.RawQuery != "" {
+		apiPath += "?" + r.URL.RawQuery
+	}
+	s.proxyAdminJSONNoStore(w, r, apiPath, 4<<20)
+}
+
+func (s *server) handleModerationCaseAPI(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid moderation case id")
+		return
+	}
+	s.proxyAdminJSONNoStore(w, r, fmt.Sprintf("/v1/moderation/cases/%d", id), 4<<20)
+}
+
+func (s *server) handleModerationReportAPI(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid moderation report id")
+		return
+	}
+	s.proxyAdminJSONNoStore(w, r, fmt.Sprintf("/v1/moderation/reports/%d", id), 4<<20)
+}
+
+func (s *server) handleClaimModerationCaseAPI(w http.ResponseWriter, r *http.Request) {
+	s.proxyModerationWrite(w, r, "claim", false)
+}
+
+func (s *server) handleDecideModerationCaseAPI(w http.ResponseWriter, r *http.Request) {
+	s.proxyModerationWrite(w, r, "decide", true)
+}
+
+func (s *server) handleReviewModerationAppealAPI(w http.ResponseWriter, r *http.Request) {
+	s.proxyModerationWrite(w, r, "appeals/"+r.PathValue("appeal_id")+"/review", true)
+}
+
+func (s *server) proxyModerationWrite(w http.ResponseWriter, r *http.Request, suffix string, needsCommand bool) {
+	caseID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || caseID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid moderation case id")
+		return
+	}
+	if strings.HasPrefix(suffix, "appeals/") {
+		appealID, err := strconv.ParseInt(r.PathValue("appeal_id"), 10, 64)
+		if err != nil || appealID <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "invalid moderation appeal id")
+			return
+		}
+	}
+	defer r.Body.Close()
+	var payload map[string]any
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := decoder.Decode(&payload); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	payload["actor"] = actorFromContext(r.Context())
+	if needsCommand {
+		commandID, _ := payload["command_id"].(string)
+		if strings.TrimSpace(commandID) == "" {
+			payload["command_id"] = newCommandID("moderation")
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.relayAdminJSON(
+		w, r, http.MethodPost,
+		fmt.Sprintf("/v1/moderation/cases/%d/%s", caseID, suffix),
+		raw, 4<<20,
+	)
+}
+
+func (s *server) relayAdminJSON(w http.ResponseWriter, r *http.Request, method, apiPath string, body []byte, maxBytes int64) {
+	req, err := http.NewRequestWithContext(
+		r.Context(), method, s.cfg.AdminAPIURL+apiPath, bytes.NewReader(body),
+	)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil || int64(len(raw)) > maxBytes {
+		writeAPIError(w, http.StatusBadGateway, "invalid admin api response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(raw)
+}
+
+func (s *server) handleAccountsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	q := r.URL.Query().Get("q")
+	beforeID, _ := parseInt64(r.URL.Query().Get("before_id"))
+	beforeActiveUS, _ := parseInt64(r.URL.Query().Get("before_active_us"))
+	limit, _ := parseInt(r.URL.Query().Get("limit"))
+	query := r.URL.Query()
+	filter := AccountFilter{
+		Premium:  query.Get("premium") == "1",
+		Verified: query.Get("verified") == "1",
+		Frozen:   query.Get("frozen") == "1",
+		HasEmail: query.Get("has_email") == "1",
+	}
+	rows := []AccountRow{}
+	hasMore := false
+	var err error
+	if strings.TrimSpace(q) != "" {
+		rows, hasMore, err = s.read.SearchAccounts(r.Context(), q, filter, beforeActiveUS, beforeID, limit)
+	} else {
+		rows, hasMore, err = s.read.ListAccounts(r.Context(), filter, beforeActiveUS, beforeID, limit)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nextBeforeID := int64(0)
+	nextBeforeActiveUS := int64(0)
+	if hasMore && len(rows) > 0 {
+		last := rows[len(rows)-1]
+		nextBeforeID = last.ID
+		nextBeforeActiveUS = last.LastActiveAt.UnixMicro()
+	}
+	if limit <= 0 {
+		limit = accountListDefaultLimit
+	}
+	if limit > accountListMaxLimit {
+		limit = accountListMaxLimit
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"query":                 q,
+		"limit":                 limit,
+		"rows":                  rows,
+		"has_more":              hasMore,
+		"next_before_id":        nextBeforeID,
+		"next_before_active_us": nextBeforeActiveUS,
+		"listing":               strings.TrimSpace(q) == "",
+	})
+}
+
+func (s *server) handleSharedDeviceGroupsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	offset, _ := parseInt(r.URL.Query().Get("offset"))
+	limit, _ := parseInt(r.URL.Query().Get("limit"))
+	groups, hasMore, err := s.read.ListSharedDeviceGroups(r.Context(), offset, limit)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if limit <= 0 {
+		limit = accountListDefaultLimit
+	}
+	if limit > accountListMaxLimit {
+		limit = accountListMaxLimit
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"limit":       limit,
+		"offset":      offset,
+		"rows":        groups,
+		"has_more":    hasMore,
+		"next_offset": offset + limit,
+	})
+}
+
+func (s *server) handleBroadcastsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	beforeID, _ := parseInt64(r.URL.Query().Get("before_id"))
+	limit, _ := parseInt(r.URL.Query().Get("limit"))
+	rows, hasMore, err := s.read.ListBroadcasts(r.Context(), beforeID, limit)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nextBeforeID := int64(0)
+	if hasMore && len(rows) > 0 {
+		nextBeforeID = rows[len(rows)-1].ID
+	}
+	if limit <= 0 {
+		limit = accountListDefaultLimit
+	}
+	if limit > accountListMaxLimit {
+		limit = accountListMaxLimit
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"limit":          limit,
+		"rows":           rows,
+		"has_more":       hasMore,
+		"next_before_id": nextBeforeID,
+	})
+}
+
+func (s *server) handleAccountsStatsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	total, err := s.read.CountAccounts(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	online, err := s.read.CountOnlineAccounts(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	filters, err := s.read.CountAccountFilters(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":   total,
+		"online":  online,
+		"filters": filters,
+	})
+}
+
+func (s *server) handleAccountDetailAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	userID, err := parseInt64(r.PathValue("id"))
+	if err != nil || userID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	detail, err := s.read.AccountDetail(r.Context(), userID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// handleAccountAvatarAPI streams the account's current profile photo straight
+// through from the real telesrv admin API (/v1/accounts/{id}/avatar) — unlike
+// every other /api/* handler here, the response is raw image bytes, not JSON,
+// so it can't reuse callAdminAPI/writeJSON.
+func (s *server) handleAccountAvatarAPI(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseInt64(r.PathValue("id"))
+	if err != nil || userID <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	apiPath := fmt.Sprintf("/v1/accounts/%d/avatar", userID)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.cfg.AdminAPIURL+apiPath, nil)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil || len(data) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// handleChannelAvatarAPI streams a channel's current avatar straight through
+// from the real telesrv admin API (/v1/channels/{id}/avatar), mirroring
+// handleAccountAvatarAPI.
+func (s *server) handleChannelAvatarAPI(w http.ResponseWriter, r *http.Request) {
+	channelID, err := parseInt64(r.PathValue("id"))
+	if err != nil || channelID <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	apiPath := fmt.Sprintf("/v1/channels/%d/avatar", channelID)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.cfg.AdminAPIURL+apiPath, nil)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil || len(data) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+type setChannelAvatarAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ChannelID int64  `json:"channel_id"`
+}
+
+func (s *server) handleSetChannelAvatarAPI(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, admin.MaxAccountAvatarBytes+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var body setChannelAvatarAPIRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "avatar file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, admin.MaxAccountAvatarBytes+1))
+	if err != nil || len(data) == 0 || int64(len(data)) > admin.MaxAccountAvatarBytes {
+		writeAPIError(w, http.StatusBadRequest, "avatar file is empty or too large")
+		return
+	}
+	req := admin.SetChannelAvatarRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-channel-avatar"),
+		ChannelID:   body.ChannelID,
+		FileName:    header.Filename,
+	}
+	result, err := s.callAdminMultipart(r.Context(), "/v1/channels/set-avatar", req, header.Filename, data)
+	writeCommandResultAPI(w, result, err)
+}
+
+// filterOutBot drops the given bot id from a row slice in place, preserving
+// order. Used to keep a hidden built-in bot out of admin listings without
+// touching the underlying SQL projection.
+func filterOutBot(rows []BotRow, excludeID int64) []BotRow {
+	out := rows[:0]
+	for _, row := range rows {
+		if row.ID != excludeID {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func (s *server) handleBotsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	q := r.URL.Query().Get("q")
+	beforeID, _ := parseInt64(r.URL.Query().Get("before_id"))
+	limit, _ := parseInt(r.URL.Query().Get("limit"))
+	filter := BotFilter{
+		Verified: r.URL.Query().Get("verified") == "1",
+		System:   r.URL.Query().Get("system") == "1",
+		UserMade: r.URL.Query().Get("user") == "1",
+	}
+	rows := []BotRow{}
+	hasMore := false
+	var err error
+	if strings.TrimSpace(q) != "" {
+		rows, err = s.read.SearchBots(r.Context(), q, filter)
+	} else {
+		rows, hasMore, err = s.read.ListBots(r.Context(), filter, beforeID, limit)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	hiddenBotID := int64(0)
+	if s.cfg.HideThirdPartyVerification {
+		hiddenBotID = domain.VerifierBotUserID
+	}
+	filterCounts, err := s.read.CountBotFilters(r.Context(), hiddenBotID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// @marksbot is not fully finished (see requireThirdPartyVerificationVisible):
+	// while third-party verification is hidden, it must not be discoverable in
+	// the bot list either, not just unreachable at /api/botverification/*.
+	if s.cfg.HideThirdPartyVerification {
+		rows = filterOutBot(rows, domain.VerifierBotUserID)
+	}
+	nextBeforeID := int64(0)
+	if hasMore && len(rows) > 0 {
+		nextBeforeID = rows[len(rows)-1].ID
+	}
+	if limit <= 0 {
+		limit = accountListDefaultLimit
+	}
+	if limit > accountListMaxLimit {
+		limit = accountListMaxLimit
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"query":          q,
+		"limit":          limit,
+		"rows":           rows,
+		"has_more":       hasMore,
+		"next_before_id": nextBeforeID,
+		"listing":        strings.TrimSpace(q) == "",
+		"filter_counts":  filterCounts,
+	})
+}
+
+func (s *server) handleBotDetailAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	botID, err := parseInt64(r.PathValue("id"))
+	if err != nil || botID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if s.cfg.HideThirdPartyVerification && botID == domain.VerifierBotUserID {
+		writeAPIError(w, http.StatusNotFound, "bot not found")
+		return
+	}
+	detail, err := s.read.BotDetail(r.Context(), botID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+type createBotAPIRequest struct {
+	CommandID   string `json:"command_id"`
+	Reason      string `json:"reason"`
+	Confirm     bool   `json:"confirm"`
+	OwnerUserID int64  `json:"owner_user_id"`
+	Name        string `json:"name"`
+	Username    string `json:"username"`
+}
+
+func (s *server) handleCreateBotAPI(w http.ResponseWriter, r *http.Request) {
+	var body createBotAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.CreateBotRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "create-bot"),
+		OwnerUserID: body.OwnerUserID,
+		Name:        body.Name,
+		Username:    body.Username,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/bots/create", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type createBroadcastAPIRequest struct {
+	CommandID  string  `json:"command_id"`
+	Reason     string  `json:"reason"`
+	Confirm    bool    `json:"confirm"`
+	Message    string  `json:"message"`
+	TargetMode string  `json:"target_mode"`
+	UserIDs    []int64 `json:"user_ids,omitempty"`
+}
+
+// handleCreateBroadcastAPI forwards a broadcast create straight to the admin
+// API. "all" mode is no longer pre-resolved into an explicit id list here:
+// the admin service snapshots the current eligible user set itself and the
+// broadcast worker enumerates it incrementally, so "every user" never has
+// to cross this boundary (or the one after it) as a potentially huge id
+// slice. Only "selected" mode carries UserIDs, already an operator-picked
+// list bounded by domain.MaxBroadcastSelectedRecipients.
+func (s *server) handleCreateBroadcastAPI(w http.ResponseWriter, r *http.Request) {
+	var body createBroadcastAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	userIDs := body.UserIDs
+	if body.TargetMode == "all" {
+		userIDs = nil
+	}
+	req := admin.CreateBroadcastRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "create-broadcast"),
+		Message:     body.Message,
+		TargetMode:  body.TargetMode,
+		UserIDs:     userIDs,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/broadcasts/create", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type deleteBotAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	BotUserID int64  `json:"bot_user_id"`
+}
+
+func (s *server) handleDeleteBotAPI(w http.ResponseWriter, r *http.Request) {
+	var body deleteBotAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DeleteBotRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "delete-bot"),
+		BotUserID:   body.BotUserID,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/bots/delete", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type exportBotTokenAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	BotUserID int64  `json:"bot_user_id"`
+}
+
+func (s *server) handleExportBotTokenAPI(w http.ResponseWriter, r *http.Request) {
+	var body exportBotTokenAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.ExportBotTokenRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "export-bot-token"),
+		BotUserID:   body.BotUserID,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/bots/export-token", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+func (s *server) handleChannelsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	q := r.URL.Query().Get("q")
+	beforeID, _ := parseInt64(r.URL.Query().Get("before_id"))
+	beforeUpdatedUS, _ := parseInt64(r.URL.Query().Get("before_updated_us"))
+	limit, _ := parseInt(r.URL.Query().Get("limit"))
+	filter := ChannelFilter{
+		Channels: r.URL.Query().Get("channels") == "1",
+		Groups:   r.URL.Query().Get("groups") == "1",
+		Verified: r.URL.Query().Get("verified") == "1",
+	}
+	rows := []ChannelRow{}
+	hasMore := false
+	var err error
+	if strings.TrimSpace(q) != "" {
+		rows, err = s.read.SearchChannels(r.Context(), q, filter)
+	} else {
+		rows, hasMore, err = s.read.ListChannels(r.Context(), filter, beforeUpdatedUS, beforeID, limit)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	filterCounts, err := s.read.CountChannelFilters(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nextBeforeID := int64(0)
+	nextBeforeUpdatedUS := int64(0)
+	if hasMore && len(rows) > 0 {
+		last := rows[len(rows)-1]
+		nextBeforeID = last.ID
+		nextBeforeUpdatedUS = last.UpdatedAt.UnixMicro()
+	}
+	if limit <= 0 {
+		limit = channelListDefaultLimit
+	}
+	if limit > channelListMaxLimit {
+		limit = channelListMaxLimit
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"query":                  q,
+		"limit":                  limit,
+		"rows":                   rows,
+		"has_more":               hasMore,
+		"next_before_id":         nextBeforeID,
+		"next_before_updated_us": nextBeforeUpdatedUS,
+		"listing":                strings.TrimSpace(q) == "",
+		"filter_counts":          filterCounts,
+	})
+}
+
+func (s *server) handleChannelDetailAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	channelID, err := parseInt64(r.PathValue("id"))
+	if err != nil || channelID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	detail, err := s.read.ChannelDetail(r.Context(), channelID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+func (s *server) handleMessagesAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	q := r.URL.Query()
+	owner, _ := parseInt64(q.Get("owner_user_id"))
+	peer, _ := parseInt64(q.Get("peer_id"))
+	beforeDate, _ := parseInt64(q.Get("before_date"))
+	beforeID, _ := parseInt(q.Get("before_id"))
+	limit, _ := parseInt(q.Get("limit"))
+	rows := []MessageRow{}
+	var err error
+	if owner > 0 && peer > 0 {
+		rows, err = s.read.ListMessages(r.Context(), owner, peer, beforeDate, beforeID, limit)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"owner_user_id": owner,
+		"peer_id":       peer,
+		"before_date":   beforeDate,
+		"before_id":     beforeID,
+		"limit":         limit,
+		"rows":          rows,
+	})
+}
+
+func (s *server) handleMessageDetailAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	owner, err1 := parseInt64(r.URL.Query().Get("owner_user_id"))
+	msgID, err2 := parseInt(r.URL.Query().Get("msg_id"))
+	if err1 != nil || err2 != nil || owner <= 0 || msgID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid owner/msg_id")
+		return
+	}
+	detail, err := s.read.MessageDetail(r.Context(), owner, msgID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+func (s *server) handleGroupMessagesAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	q := r.URL.Query()
+	channelID, _ := parseInt64(q.Get("channel_id"))
+	beforeDate, _ := parseInt64(q.Get("before_date"))
+	beforeID, _ := parseInt(q.Get("before_id"))
+	limit, _ := parseInt(q.Get("limit"))
+	rows := []GroupMessageRow{}
+	var err error
+	if channelID > 0 {
+		rows, err = s.read.ListGroupMessages(r.Context(), channelID, beforeDate, beforeID, limit)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if limit <= 0 || limit > messagePageLimit {
+		limit = messagePageLimit
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"channel_id":  channelID,
+		"before_date": beforeDate,
+		"before_id":   beforeID,
+		"limit":       limit,
+		"rows":        rows,
+	})
+}
+
+func (s *server) handleGroupMessageDetailAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	channelID, err1 := parseInt64(r.URL.Query().Get("channel_id"))
+	msgID, err2 := parseInt(r.URL.Query().Get("msg_id"))
+	if err1 != nil || err2 != nil || channelID <= 0 || msgID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid channel_id/msg_id")
+		return
+	}
+	detail, err := s.read.GroupMessageDetail(r.Context(), channelID, msgID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+type setAccountFrozenAPIRequest struct {
+	CommandID string    `json:"command_id"`
+	Reason    string    `json:"reason"`
+	Confirm   bool      `json:"confirm"`
+	UserID    int64     `json:"user_id"`
+	Frozen    bool      `json:"frozen"`
+	Until     time.Time `json:"freeze_until"`
+	AppealURL string    `json:"freeze_appeal_url"`
+}
+
+func (s *server) handleSetAccountFrozenAPI(w http.ResponseWriter, r *http.Request) {
+	var body setAccountFrozenAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetAccountFrozenRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-frozen"),
+		UserID:      body.UserID,
+		Frozen:      body.Frozen,
+		Until:       body.Until,
+		AppealURL:   body.AppealURL,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-frozen", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type grantPremiumAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Months    int    `json:"months"`
+}
+
+func (s *server) handleGrantPremiumAPI(w http.ResponseWriter, r *http.Request) {
+	var body grantPremiumAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.GrantPremiumRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "grant-premium"),
+		UserID:      body.UserID,
+		Months:      body.Months,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/grant-premium", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type grantStarsAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Amount    int64  `json:"amount"`
+}
+
+func (s *server) handleGrantStarsAPI(w http.ResponseWriter, r *http.Request) {
+	var body grantStarsAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.GrantStarsRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "grant-stars"),
+		UserID:      body.UserID,
+		Amount:      body.Amount,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/grant-stars", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setVerifiedAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Verified  bool   `json:"verified"`
+}
+
+func (s *server) handleSetVerifiedAPI(w http.ResponseWriter, r *http.Request) {
+	var body setVerifiedAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetVerifiedRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-verified"),
+		UserID:      body.UserID,
+		Verified:    body.Verified,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-verified", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setUserFlagsAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Scam      bool   `json:"scam"`
+	Fake      bool   `json:"fake"`
+}
+
+func (s *server) handleSetUserFlagsAPI(w http.ResponseWriter, r *http.Request) {
+	var body setUserFlagsAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetUserFlagsRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-account-flags"),
+		UserID:      body.UserID,
+		Scam:        body.Scam,
+		Fake:        body.Fake,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-flags", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setChannelFlagsAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ChannelID int64  `json:"channel_id"`
+	Scam      bool   `json:"scam"`
+	Fake      bool   `json:"fake"`
+}
+
+func (s *server) handleSetChannelFlagsAPI(w http.ResponseWriter, r *http.Request) {
+	var body setChannelFlagsAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetChannelFlagsRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-channel-flags"),
+		ChannelID:   body.ChannelID,
+		Scam:        body.Scam,
+		Fake:        body.Fake,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/channels/set-flags", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setSupportAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Support   bool   `json:"support"`
+}
+
+func (s *server) handleSetSupportAPI(w http.ResponseWriter, r *http.Request) {
+	var body setSupportAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetSupportRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-support"),
+		UserID:      body.UserID,
+		Support:     body.Support,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-support", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setUsernameAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Username  string `json:"username"`
+}
+
+func (s *server) handleSetUsernameAPI(w http.ResponseWriter, r *http.Request) {
+	var body setUsernameAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetUsernameRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-username"),
+		UserID:      body.UserID,
+		Username:    body.Username,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-username", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setProfileAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+func (s *server) handleSetProfileAPI(w http.ResponseWriter, r *http.Request) {
+	var body setProfileAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetProfileRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-profile"),
+		UserID:      body.UserID,
+		FirstName:   body.FirstName,
+		LastName:    body.LastName,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-profile", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setPhoneAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Phone     string `json:"phone"`
+}
+
+func (s *server) handleSetPhoneAPI(w http.ResponseWriter, r *http.Request) {
+	var body setPhoneAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetPhoneRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-phone"),
+		UserID:      body.UserID,
+		Phone:       body.Phone,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-phone", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setLoginEmailAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+	Email     string `json:"email"`
+}
+
+func (s *server) handleSetLoginEmailAPI(w http.ResponseWriter, r *http.Request) {
+	var body setLoginEmailAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetLoginEmailRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-login-email"),
+		UserID:      body.UserID,
+		Email:       body.Email,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-login-email", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setAccountAvatarAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	UserID    int64  `json:"user_id"`
+}
+
+func (s *server) handleSetAccountAvatarAPI(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, admin.MaxAccountAvatarBytes+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var body setAccountAvatarAPIRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "avatar file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, admin.MaxAccountAvatarBytes+1))
+	if err != nil || len(data) == 0 || int64(len(data)) > admin.MaxAccountAvatarBytes {
+		writeAPIError(w, http.StatusBadRequest, "avatar file is empty or too large")
+		return
+	}
+	req := admin.SetAccountAvatarRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-avatar"),
+		UserID:      body.UserID,
+		FileName:    header.Filename,
+	}
+	result, err := s.callAdminMultipart(r.Context(), "/v1/accounts/set-avatar", req, header.Filename, data)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setAccountAvatarVideoAPIRequest struct {
+	CommandID    string  `json:"command_id"`
+	Reason       string  `json:"reason"`
+	Confirm      bool    `json:"confirm"`
+	UserID       int64   `json:"user_id"`
+	VideoStartTs float64 `json:"video_start_ts"`
+}
+
+func (s *server) handleSetAccountAvatarVideoAPI(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, admin.MaxAccountAvatarVideoBytes+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var body setAccountAvatarVideoAPIRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "avatar video file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, admin.MaxAccountAvatarVideoBytes+1))
+	if err != nil || len(data) == 0 || int64(len(data)) > admin.MaxAccountAvatarVideoBytes {
+		writeAPIError(w, http.StatusBadRequest, "avatar video file is empty or too large")
+		return
+	}
+	req := admin.SetAccountAvatarVideoRequest{
+		CommandMeta:  s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-avatar-video"),
+		UserID:       body.UserID,
+		FileName:     header.Filename,
+		VideoStartTs: body.VideoStartTs,
+	}
+	result, err := s.callAdminMultipart(r.Context(), "/v1/accounts/set-avatar-video", req, header.Filename, data)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setUserColorAPIRequest struct {
+	CommandID         string `json:"command_id"`
+	Reason            string `json:"reason"`
+	Confirm           bool   `json:"confirm"`
+	UserID            int64  `json:"user_id"`
+	ForProfile        bool   `json:"for_profile"`
+	HasColor          bool   `json:"has_color"`
+	Color             int    `json:"color"`
+	BackgroundEmojiID int64  `json:"background_emoji_id,string"`
+}
+
+func (s *server) handleSetUserColorAPI(w http.ResponseWriter, r *http.Request) {
+	var body setUserColorAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetUserColorRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-account-color"),
+		UserID:      body.UserID,
+		PeerColorInput: admin.PeerColorInput{
+			ForProfile: body.ForProfile, HasColor: body.HasColor, Color: body.Color, BackgroundEmojiID: body.BackgroundEmojiID,
+		},
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-color", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setUserEmojiStatusAPIRequest struct {
+	CommandID  string `json:"command_id"`
+	Reason     string `json:"reason"`
+	Confirm    bool   `json:"confirm"`
+	UserID     int64  `json:"user_id"`
+	DocumentID int64  `json:"document_id,string"`
+	Until      int    `json:"until"`
+}
+
+func (s *server) handleSetUserEmojiStatusAPI(w http.ResponseWriter, r *http.Request) {
+	var body setUserEmojiStatusAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetUserEmojiStatusRequest{
+		CommandMeta:      s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-account-emoji-status"),
+		UserID:           body.UserID,
+		EmojiStatusInput: admin.EmojiStatusInput{DocumentID: body.DocumentID, Until: body.Until},
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/set-emoji-status", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setChannelSettingsAPIRequest struct {
+	CommandID          string `json:"command_id"`
+	Reason             string `json:"reason"`
+	Confirm            bool   `json:"confirm"`
+	ChannelID          int64  `json:"channel_id"`
+	Gigagroup          *bool  `json:"gigagroup,omitempty"`
+	AntiSpam           *bool  `json:"antispam,omitempty"`
+	ParticipantsHidden *bool  `json:"participants_hidden,omitempty"`
+	NoForwards         *bool  `json:"noforwards,omitempty"`
+	JoinToSend         *bool  `json:"join_to_send,omitempty"`
+	JoinRequest        *bool  `json:"join_request,omitempty"`
+	SlowmodeSeconds    *int   `json:"slowmode_seconds,omitempty"`
+}
+
+func (s *server) handleSetChannelSettingsAPI(w http.ResponseWriter, r *http.Request) {
+	var body setChannelSettingsAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetChannelSettingsRequest{
+		CommandMeta:        s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-channel-settings"),
+		ChannelID:          body.ChannelID,
+		Gigagroup:          body.Gigagroup,
+		AntiSpam:           body.AntiSpam,
+		ParticipantsHidden: body.ParticipantsHidden,
+		NoForwards:         body.NoForwards,
+		JoinToSend:         body.JoinToSend,
+		JoinRequest:        body.JoinRequest,
+		SlowmodeSeconds:    body.SlowmodeSeconds,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/channels/set-settings", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setChannelUsernameAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ChannelID int64  `json:"channel_id"`
+	Username  string `json:"username"`
+}
+
+func (s *server) handleSetChannelUsernameAPI(w http.ResponseWriter, r *http.Request) {
+	var body setChannelUsernameAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetChannelUsernameRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-channel-username"),
+		ChannelID:   body.ChannelID,
+		Username:    body.Username,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/channels/set-username", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setChannelColorAPIRequest struct {
+	CommandID         string `json:"command_id"`
+	Reason            string `json:"reason"`
+	Confirm           bool   `json:"confirm"`
+	ChannelID         int64  `json:"channel_id"`
+	ForProfile        bool   `json:"for_profile"`
+	HasColor          bool   `json:"has_color"`
+	Color             int    `json:"color"`
+	BackgroundEmojiID int64  `json:"background_emoji_id,string"`
+}
+
+func (s *server) handleSetChannelColorAPI(w http.ResponseWriter, r *http.Request) {
+	var body setChannelColorAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetChannelColorRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-channel-color"),
+		ChannelID:   body.ChannelID,
+		PeerColorInput: admin.PeerColorInput{
+			ForProfile: body.ForProfile, HasColor: body.HasColor, Color: body.Color, BackgroundEmojiID: body.BackgroundEmojiID,
+		},
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/channels/set-color", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setChannelEmojiStatusAPIRequest struct {
+	CommandID  string `json:"command_id"`
+	Reason     string `json:"reason"`
+	Confirm    bool   `json:"confirm"`
+	ChannelID  int64  `json:"channel_id"`
+	DocumentID int64  `json:"document_id,string"`
+	Until      int    `json:"until"`
+}
+
+func (s *server) handleSetChannelEmojiStatusAPI(w http.ResponseWriter, r *http.Request) {
+	var body setChannelEmojiStatusAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetChannelEmojiStatusRequest{
+		CommandMeta:      s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-channel-emoji-status"),
+		ChannelID:        body.ChannelID,
+		EmojiStatusInput: admin.EmojiStatusInput{DocumentID: body.DocumentID, Until: body.Until},
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/channels/set-emoji-status", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setChannelVerifiedAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ChannelID int64  `json:"channel_id"`
+	Verified  bool   `json:"verified"`
+}
+
+func (s *server) handleSetChannelVerifiedAPI(w http.ResponseWriter, r *http.Request) {
+	var body setChannelVerifiedAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetChannelVerifiedRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-channel-verified"),
+		ChannelID:   body.ChannelID,
+		Verified:    body.Verified,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/channels/set-verified", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type revokeSessionsAPIRequest struct {
+	CommandID string    `json:"command_id"`
+	Reason    string    `json:"reason"`
+	Confirm   bool      `json:"confirm"`
+	UserID    flexInt64 `json:"user_id"`
+	Hash      flexInt64 `json:"hash"`
+	KeepHash  flexInt64 `json:"keep_hash"`
+	RevokeAll bool      `json:"revoke_all"`
+}
+
+func (s *server) handleRevokeSessionsAPI(w http.ResponseWriter, r *http.Request) {
+	var body revokeSessionsAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.RevokeSessionsRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "revoke-sessions"),
+		UserID:      body.UserID.Int64(),
+		Hash:        body.Hash.Int64(),
+		KeepHash:    body.KeepHash.Int64(),
+		RevokeAll:   body.RevokeAll,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/accounts/revoke-sessions", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type deleteMessagesAPIRequest struct {
+	CommandID   string `json:"command_id"`
+	Reason      string `json:"reason"`
+	Confirm     bool   `json:"confirm"`
+	OwnerUserID int64  `json:"owner_user_id"`
+	PeerID      int64  `json:"peer_id"`
+	IDs         []int  `json:"ids"`
+	Revoke      bool   `json:"revoke"`
+}
+
+func (s *server) handleDeleteMessagesAPI(w http.ResponseWriter, r *http.Request) {
+	var body deleteMessagesAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DeletePrivateMessagesRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "delete-messages"),
+		OwnerUserID: body.OwnerUserID,
+		Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: body.PeerID},
+		IDs:         body.IDs,
+		Revoke:      body.Revoke,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/messages/delete", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type deleteHistoryAPIRequest struct {
+	CommandID   string `json:"command_id"`
+	Reason      string `json:"reason"`
+	Confirm     bool   `json:"confirm"`
+	OwnerUserID int64  `json:"owner_user_id"`
+	PeerID      int64  `json:"peer_id"`
+	MaxID       int    `json:"max_id"`
+	MinDate     int    `json:"min_date"`
+	MaxDate     int    `json:"max_date"`
+	MaxBatches  int    `json:"max_batches"`
+	JustClear   bool   `json:"just_clear"`
+	Revoke      bool   `json:"revoke"`
+}
+
+func (s *server) handleDeleteHistoryAPI(w http.ResponseWriter, r *http.Request) {
+	var body deleteHistoryAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DeletePrivateHistoryRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "delete-history"),
+		OwnerUserID: body.OwnerUserID,
+		Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: body.PeerID},
+		MaxID:       body.MaxID,
+		MinDate:     body.MinDate,
+		MaxDate:     body.MaxDate,
+		JustClear:   body.JustClear,
+		Revoke:      body.Revoke,
+		MaxBatches:  body.MaxBatches,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/messages/delete-history", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type renameStickerSetAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	SetID     int64  `json:"set_id,string"`
+	Title     string `json:"title"`
+}
+
+func (s *server) handleRenameStickerSetAPI(w http.ResponseWriter, r *http.Request) {
+	var body renameStickerSetAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.RenameStickerSetRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "rename-sticker-set"),
+		SetID:       body.SetID, Title: body.Title,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/stickers/rename", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type deleteStickerSetAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	SetID     int64  `json:"set_id,string"`
+}
+
+func (s *server) handleDeleteStickerSetAPI(w http.ResponseWriter, r *http.Request) {
+	var body deleteStickerSetAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DeleteStickerSetRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "delete-sticker-set"),
+		SetID:       body.SetID,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/stickers/delete", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type createStickerSetAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	Title     string `json:"title"`
+	ShortName string `json:"short_name"`
+	Kind      string `json:"kind"`
+	Emoji     string `json:"emoji"`
+	Keywords  string `json:"keywords,omitempty"`
+}
+
+func (s *server) handleCreateStickerSetAPI(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 21<<20)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var body createStickerSetAPIRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "sticker file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (20<<20)+1))
+	if err != nil || len(data) == 0 || len(data) > 20<<20 {
+		writeAPIError(w, http.StatusBadRequest, "sticker file is empty or too large")
+		return
+	}
+	req := admin.CreateStickerSetRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "create-sticker-set"),
+		Title:       body.Title, ShortName: body.ShortName, Kind: body.Kind,
+		Emoji: body.Emoji, Keywords: body.Keywords, FileName: header.Filename,
+	}
+	result, err := s.callAdminMultipart(r.Context(), "/v1/stickers/create", req, header.Filename, data)
+	writeCommandResultAPI(w, result, err)
+}
+
+type addStickerToSetAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	SetID     int64  `json:"set_id,string"`
+	Emoji     string `json:"emoji"`
+	Keywords  string `json:"keywords,omitempty"`
+}
+
+func (s *server) handleAddStickerToSetAPI(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 21<<20)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var body addStickerToSetAPIRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "sticker file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (20<<20)+1))
+	if err != nil || len(data) == 0 || len(data) > 20<<20 {
+		writeAPIError(w, http.StatusBadRequest, "sticker file is empty or too large")
+		return
+	}
+	req := admin.AddStickerToSetRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "add-sticker-to-set"),
+		SetID:       body.SetID, Emoji: body.Emoji, Keywords: body.Keywords, FileName: header.Filename,
+	}
+	result, err := s.callAdminMultipart(r.Context(), "/v1/stickers/add", req, header.Filename, data)
+	writeCommandResultAPI(w, result, err)
+}
+
+type removeStickerFromSetAPIRequest struct {
+	CommandID  string `json:"command_id"`
+	Reason     string `json:"reason"`
+	Confirm    bool   `json:"confirm"`
+	SetID      int64  `json:"set_id,string"`
+	DocumentID int64  `json:"document_id,string"`
+}
+
+func (s *server) handleRemoveStickerFromSetAPI(w http.ResponseWriter, r *http.Request) {
+	var body removeStickerFromSetAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.RemoveStickerFromSetRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "remove-sticker-from-set"),
+		SetID:       body.SetID, DocumentID: body.DocumentID,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/stickers/remove", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+func (s *server) handleGifCatalogAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	rows, err := s.read.ListGifCatalog(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rows": rows})
+}
+
+type createGifCatalogEntryAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	Title     string `json:"title"`
+}
+
+func (s *server) handleCreateGifCatalogEntryAPI(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, domain.MaxGifCatalogUploadSize+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var body createGifCatalogEntryAPIRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "gif file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, domain.MaxGifCatalogUploadSize+1))
+	if err != nil || len(data) == 0 || int64(len(data)) > domain.MaxGifCatalogUploadSize {
+		writeAPIError(w, http.StatusBadRequest, "gif file is empty or too large")
+		return
+	}
+	req := admin.CreateGifCatalogEntryRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "create-gif-catalog-entry"),
+		Title:       body.Title, FileName: header.Filename,
+	}
+	result, err := s.callAdminMultipart(r.Context(), "/v1/gif-catalog/create", req, header.Filename, data)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setGifCatalogEnabledAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ID        int64  `json:"id,string"`
+	Enabled   bool   `json:"enabled"`
+}
+
+func (s *server) handleSetGifCatalogEnabledAPI(w http.ResponseWriter, r *http.Request) {
+	var body setGifCatalogEnabledAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetGifCatalogEnabledRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-gif-catalog-enabled"),
+		ID:          body.ID, Enabled: body.Enabled,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/set-enabled", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setGifCatalogSortOrderAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ID        int64  `json:"id,string"`
+	SortOrder int    `json:"sort_order"`
+}
+
+func (s *server) handleSetGifCatalogSortOrderAPI(w http.ResponseWriter, r *http.Request) {
+	var body setGifCatalogSortOrderAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetGifCatalogSortOrderRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-gif-catalog-sort-order"),
+		ID:          body.ID, SortOrder: body.SortOrder,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/set-sort-order", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setGifCatalogCategoryAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ID        int64  `json:"id,string"`
+	Category  string `json:"category"`
+}
+
+func (s *server) handleSetGifCatalogCategoryAPI(w http.ResponseWriter, r *http.Request) {
+	var body setGifCatalogCategoryAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetGifCatalogCategoryRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-gif-catalog-category"),
+		ID:          body.ID, Category: body.Category,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/set-category", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type autoCategorizeGifCatalogAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+}
+
+func (s *server) handleAutoCategorizeGifCatalogAPI(w http.ResponseWriter, r *http.Request) {
+	var body autoCategorizeGifCatalogAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.AutoCategorizeGifCatalogRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "auto-categorize-gif-catalog"),
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/auto-categorize", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type deleteUncategorizedGifsAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+}
+
+func (s *server) handleDeleteUncategorizedGifsAPI(w http.ResponseWriter, r *http.Request) {
+	var body deleteUncategorizedGifsAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DeleteUncategorizedGifsRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "delete-uncategorized-gifs"),
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/delete-uncategorized", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+// storageManualPurgeAPIRequest mirrors ManualPurgeStorageRequest's frontend
+// payload (see StoragePage.tsx's manual purge modal): categories/include_avatars
+// go through as native JSON, created_before is an ISO/RFC3339 date string
+// (produced by `new Date(x).toISOString()` on the frontend, same convention
+// as freeze_until -- see setAccountFrozenAPIRequest.Until) that encoding/json
+// parses straight into *time.Time; the field left undefined by the frontend
+// (no date entered) decodes to nil, meaning no age filter at all.
+type storageManualPurgeAPIRequest struct {
+	CommandID      string     `json:"command_id"`
+	Reason         string     `json:"reason"`
+	Confirm        bool       `json:"confirm"`
+	Categories     []string   `json:"categories"`
+	IncludeAvatars bool       `json:"include_avatars"`
+	CreatedBefore  *time.Time `json:"created_before"`
+}
+
+func (s *server) handleStorageManualPurgeAPI(w http.ResponseWriter, r *http.Request) {
+	var body storageManualPurgeAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.ManualPurgeStorageRequest{
+		CommandMeta:    s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "storage-manual-purge"),
+		Categories:     body.Categories,
+		IncludeAvatars: body.IncludeAvatars,
+		CreatedBefore:  body.CreatedBefore,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/storage/manual-purge", req)
+	if err == nil && body.Confirm {
+		s.stats.invalidateStorage()
+	}
+	writeCommandResultAPI(w, result, err)
+}
+
+type deleteGifCatalogEntryAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	ID        int64  `json:"id,string"`
+}
+
+func (s *server) handleDeleteGifCatalogEntryAPI(w http.ResponseWriter, r *http.Request) {
+	var body deleteGifCatalogEntryAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DeleteGifCatalogEntryRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "delete-gif-catalog-entry"),
+		ID:          body.ID,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/gif-catalog/delete", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+func (s *server) handleStickerSetsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	rows, err := s.read.ListStickerSets(r.Context(), r.URL.Query().Get("kind"))
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rows": rows})
+}
+
+func (s *server) handleStickerSetDocumentsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	setID, err := parseInt64(r.PathValue("id"))
+	if err != nil || setID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	ids, err := s.read.StickerSetDocumentIDs(r.Context(), setID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"document_ids": ids})
+}
+
+// handleStickerDocumentAnimationAPI proxies one document's decompressed Lottie
+// JSON from the real telesrv admin API.
+func (s *server) handleStickerDocumentAnimationAPI(w http.ResponseWriter, r *http.Request) {
+	documentID, err := parseInt64(r.PathValue("id"))
+	if err != nil || documentID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid document id")
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		fmt.Sprintf("%s/v1/stickers/documents/%d/animation", s.cfg.AdminAPIURL, documentID), nil)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (8<<20)+1))
+	if err != nil || len(raw) > 8<<20 {
+		writeAPIError(w, http.StatusBadGateway, "invalid animation response")
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		writeAPIError(w, resp.StatusCode, string(raw))
+		return
+	}
+	// Content-Type is passed through as-is: the underlying document may be a
+	// decompressed Lottie animation (application/json) or a plain static
+	// raster sticker (image/webp, image/png, ...) — see
+	// admin.Service.StickerDocumentAnimation.
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
+// handleGifCatalogDocumentPreviewAPI proxies one gif_catalog document's raw
+// MP4 bytes from the real telesrv admin API, for the panel list page's
+// preview cell.
+func (s *server) handleGifCatalogDocumentPreviewAPI(w http.ResponseWriter, r *http.Request) {
+	documentID, err := parseInt64(r.PathValue("id"))
+	if err != nil || documentID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid document id")
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		fmt.Sprintf("%s/v1/gif-catalog/documents/%d/preview", s.cfg.AdminAPIURL, documentID), nil)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (20<<20)+1))
+	if err != nil || len(raw) > 20<<20 {
+		writeAPIError(w, http.StatusBadGateway, "invalid preview response")
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		writeAPIError(w, resp.StatusCode, string(raw))
+		return
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "video/mp4"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
+type setStickerSetArchivedAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	SetID     int64  `json:"set_id,string"`
+	Archived  bool   `json:"archived"`
+}
+
+func (s *server) handleSetStickerSetArchivedAPI(w http.ResponseWriter, r *http.Request) {
+	var body setStickerSetArchivedAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetStickerSetArchivedRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-sticker-set-archived"),
+		SetID:       body.SetID, Archived: body.Archived,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/stickers/set-archived", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type setStickerSetSortOrderAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	SetID     int64  `json:"set_id,string"`
+	SortOrder int    `json:"sort_order"`
+}
+
+func (s *server) handleSetStickerSetSortOrderAPI(w http.ResponseWriter, r *http.Request) {
+	var body setStickerSetSortOrderAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.SetStickerSetSortOrderRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "set-sticker-set-sort-order"),
+		SetID:       body.SetID, SortOrder: body.SortOrder,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/stickers/set-sort-order", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+// flexInt64 decodes an int64 the panel may send either as a JSON number or as a
+// decimal string. Ids and nanoton amounts are sent as strings to stay exact past
+// 2^53, while a picker-supplied peer id arrives as a plain number; an empty
+// string and null both mean "unset", which is how an untouched form field looks.
+type flexInt64 int64
+
+// Int64 returns the decoded value.
+func (v flexInt64) Int64() int64 { return int64(v) }
+
+func (v *flexInt64) UnmarshalJSON(raw []byte) error {
+	text, empty := flexScalarText(raw)
+	if empty {
+		*v = 0
+		return nil
+	}
+	parsed, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid integer %s", string(raw))
+	}
+	*v = flexInt64(parsed)
+	return nil
+}
+
+// flexUnix decodes an optional timestamp as a Unix second count. A date input
+// produces an RFC3339 string and a scripted call a plain number, so both are
+// accepted; empty means "unset", which the mint command stamps with its clock.
+type flexUnix int64
+
+// Unix returns the decoded timestamp in seconds, or zero when unset.
+func (v flexUnix) Unix() int64 { return int64(v) }
+
+func (v *flexUnix) UnmarshalJSON(raw []byte) error {
+	text, empty := flexScalarText(raw)
+	if empty {
+		*v = 0
+		return nil
+	}
+	if parsed, err := strconv.ParseInt(text, 10, 64); err == nil {
+		*v = flexUnix(parsed)
+		return nil
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		if parsed, err := time.Parse(layout, text); err == nil {
+			*v = flexUnix(parsed.UTC().Unix())
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid timestamp %s", string(raw))
+}
+
+// flexScalarText unwraps a JSON scalar to its textual form and reports whether
+// it carries no value at all (null, empty string, blank).
+func flexScalarText(raw []byte) (string, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return "", true
+	}
+	if unquoted, err := strconv.Unquote(text); err == nil {
+		text = strings.TrimSpace(unquoted)
+	}
+	if text == "" {
+		return "", true
+	}
+	return text, false
+}
+
+type mintCollectibleUsernameAPIRequest struct {
+	CommandID      string    `json:"command_id"`
+	Reason         string    `json:"reason"`
+	Confirm        bool      `json:"confirm"`
+	Username       string    `json:"username"`
+	OwnerUserID    flexInt64 `json:"owner_user_id"`
+	OwnerChannelID flexInt64 `json:"owner_channel_id"`
+	Currency       string    `json:"currency"`
+	Amount         flexInt64 `json:"amount"`
+	CryptoCurrency string    `json:"crypto_currency"`
+	CryptoAmount   flexInt64 `json:"crypto_amount"`
+	URL            string    `json:"url"`
+	PurchaseDate   flexUnix  `json:"purchase_date"`
+}
+
+func (s *server) handleMintCollectibleUsernameAPI(w http.ResponseWriter, r *http.Request) {
+	var body mintCollectibleUsernameAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.MintCollectibleUsernameRequest{
+		CommandMeta:    s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "mint-collectible-username"),
+		Username:       body.Username,
+		OwnerUserID:    body.OwnerUserID.Int64(),
+		OwnerChannelID: body.OwnerChannelID.Int64(),
+		Currency:       body.Currency,
+		Amount:         body.Amount.Int64(),
+		CryptoCurrency: body.CryptoCurrency,
+		CryptoAmount:   body.CryptoAmount.Int64(),
+		URL:            body.URL,
+		PurchaseDate:   body.PurchaseDate.Unix(),
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/collectible-usernames/mint", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type transferCollectibleUsernameAPIRequest struct {
+	CommandID   string    `json:"command_id"`
+	Reason      string    `json:"reason"`
+	Confirm     bool      `json:"confirm"`
+	Username    string    `json:"username"`
+	ToUserID    flexInt64 `json:"to_user_id"`
+	ToChannelID flexInt64 `json:"to_channel_id"`
+}
+
+func (s *server) handleTransferCollectibleUsernameAPI(w http.ResponseWriter, r *http.Request) {
+	var body transferCollectibleUsernameAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.TransferCollectibleUsernameRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "transfer-collectible-username"),
+		Username:    body.Username,
+		ToUserID:    body.ToUserID.Int64(),
+		ToChannelID: body.ToChannelID.Int64(),
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/collectible-usernames/transfer", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type revokeCollectibleUsernameAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	Username  string `json:"username"`
+	Burn      bool   `json:"burn"`
+}
+
+func (s *server) handleRevokeCollectibleUsernameAPI(w http.ResponseWriter, r *http.Request) {
+	var body revokeCollectibleUsernameAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	prefix := "revoke-collectible-username"
+	if body.Burn {
+		prefix = "burn-collectible-username"
+	}
+	req := admin.RevokeCollectibleUsernameRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, prefix),
+		Username:    body.Username,
+		Burn:        body.Burn,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/collectible-usernames/revoke", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+type deleteCollectibleUsernameAPIRequest struct {
+	CommandID string `json:"command_id"`
+	Reason    string `json:"reason"`
+	Confirm   bool   `json:"confirm"`
+	Username  string `json:"username"`
+}
+
+// handleDeleteCollectibleUsernameAPI erases an asset and its provenance. The
+// panel gates it behind the same reason + dry-run + confirm flow as a burn, but
+// the outcome differs: the name becomes issuable again from scratch.
+func (s *server) handleDeleteCollectibleUsernameAPI(w http.ResponseWriter, r *http.Request) {
+	var body deleteCollectibleUsernameAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	req := admin.DeleteCollectibleUsernameRequest{
+		CommandMeta: s.commandMetaFromAPI(r, body.CommandID, body.Reason, body.Confirm, "delete-collectible-username"),
+		Username:    body.Username,
+	}
+	result, err := s.callAdminAPI(r.Context(), "/v1/collectible-usernames/delete", req)
+	writeCommandResultAPI(w, result, err)
+}
+
+// handleCollectibleUsernamesAPI pages the collectible asset table straight from
+// PostgreSQL, like every other table view, and echoes the keyset cursor as a
+// decimal string so an int64 id survives the round trip through the browser.
+func (s *server) handleCollectibleUsernamesAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	query := r.URL.Query()
+	status := strings.TrimSpace(query.Get("status"))
+	switch status {
+	case "", string(domain.CollectibleUsernameStatusVault),
+		string(domain.CollectibleUsernameStatusOwned),
+		string(domain.CollectibleUsernameStatusBurned):
+	default:
+		writeAPIError(w, http.StatusBadRequest, "invalid status")
+		return
+	}
+	ownerUserID, err := parseInt64(query.Get("owner_user_id"))
+	if err != nil || ownerUserID < 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid owner_user_id")
+		return
+	}
+	beforeID, err := parseInt64(query.Get("before_id"))
+	if err != nil || beforeID < 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid before_id")
+		return
+	}
+	limit, err := parseInt(query.Get("limit"))
+	if err != nil || limit < 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
+	rows, hasMore, err := s.read.ListCollectibleUsernames(r.Context(), status, ownerUserID, beforeID, query.Get("q"), limit)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nextBeforeID := ""
+	if hasMore && len(rows) > 0 {
+		nextBeforeID = strconv.FormatInt(rows[len(rows)-1].ID, 10)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rows":           rows,
+		"has_more":       hasMore,
+		"next_before_id": nextBeforeID,
+	})
+}
+
+func (s *server) handleCollectibleUsernameDetailAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	id, err := parseInt64(r.PathValue("id"))
+	if err != nil || id <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	detail, err := s.read.CollectibleUsernameDetail(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, errReadNotFound) {
+			writeAPIError(w, http.StatusNotFound, "collectible username not found")
+			return
+		}
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"asset":     detail.Asset,
+		"transfers": detail.Transfers,
+	})
+}
+
+func (s *server) handleStorageStatsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	stats, err := s.stats.storage.Get(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleStorageAccountsAPI pages the per-account storage breakdown,
+// largest first.
+func (s *server) handleStorageAccountsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.read == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "read store is not configured")
+		return
+	}
+	query := r.URL.Query()
+	offset, err := parseInt(query.Get("offset"))
+	if err != nil || offset < 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid offset")
+		return
+	}
+	limit, err := parseInt(query.Get("limit"))
+	if err != nil || limit < 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
+	sortDesc := query.Get("order") != "asc"
+	var (
+		rows    []AccountStorageRow
+		hasMore bool
+	)
+	if offset == 0 && limit == storageListPageSize && strings.TrimSpace(query.Get("q")) == "" {
+		// The page Storage opens on comes from memory; see statscache.go.
+		var page storageUsagePage
+		page, err = s.stats.storageList(query.Get("sort"), sortDesc).Get(r.Context())
+		rows, hasMore = page.rows, page.hasMore
+	} else {
+		rows, hasMore, err = s.read.ListAccountStorageUsage(
+			r.Context(),
+			query.Get("q"),
+			query.Get("sort"),
+			sortDesc,
+			offset,
+			limit)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nextOffset := 0
+	if hasMore {
+		nextOffset = offset + len(rows)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rows":        rows,
+		"has_more":    hasMore,
+		"next_offset": nextOffset,
+	})
+}
+
+func (s *server) commandMetaFromAPI(r *http.Request, commandID, reason string, confirm bool, prefix string) admin.CommandMeta {
+	commandID = strings.TrimSpace(commandID)
+	if confirm && strings.HasPrefix(commandID, "dry-") {
+		commandID = ""
+	}
+	dryRun := !confirm
+	if commandID == "" {
+		scope := "dry"
+		if !dryRun {
+			scope = "exec"
+		}
+		commandID = newCommandID(scope + "-" + prefix)
+	}
+	return admin.CommandMeta{
+		CommandID: commandID,
+		Actor:     actorFromContext(r.Context()),
+		Reason:    reason,
+		DryRun:    dryRun,
+	}
+}
+
+// callAdminAPIGet proxies a plain, unauthenticated-payload GET to the main
+// telesrv server's admin API and unmarshals its JSON body into out -- for
+// reads that need something only that process has (a live blockchain RPC
+// connection, here), unlike every other read on this panel, which queries
+// Postgres directly via readStore. Unlike callAdminAPI, the response isn't
+// admin.CommandResult-shaped: there's no command, dry-run or audit trail
+// for a read that mutates nothing.
+func (s *server) callAdminAPIGet(ctx context.Context, apiPath string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.AdminAPIURL+apiPath, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("admin api %s: status=%d body=%s", apiPath, resp.StatusCode, string(raw))
+	}
+	return json.Unmarshal(raw, out)
+}
+
+func (s *server) callAdminAPI(ctx context.Context, apiPath string, payload any) (admin.CommandResult, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return admin.CommandResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.AdminAPIURL+apiPath, bytes.NewReader(body))
+	if err != nil {
+		return admin.CommandResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return admin.CommandResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var result admin.CommandResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return result, fmt.Errorf("admin api %s: status=%d body=%s", apiPath, resp.StatusCode, string(raw))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if result.Error == "" {
+			result.Error = resp.Status
+		}
+		return result, errors.New(result.Error)
+	}
+	return result, nil
+}
+
+// callAdminCommand is callAdminAPI with the upstream status preserved.
+//
+// callAdminAPI deliberately loses it: every caller it has answers 502 for any
+// failure. A verification decision needs the distinction, so this variant returns
+// the HTTP status alongside the result and lets the handler map it. A status of 0
+// means no HTTP answer was obtained at all.
+func (s *server) callAdminCommand(ctx context.Context, apiPath string, payload any) (admin.CommandResult, int, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return admin.CommandResult{}, 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.AdminAPIURL+apiPath, bytes.NewReader(body))
+	if err != nil {
+		return admin.CommandResult{}, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return admin.CommandResult{}, 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var result admin.CommandResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return result, 0, fmt.Errorf("admin api %s: status=%d body=%s", apiPath, resp.StatusCode, string(raw))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if result.Error == "" {
+			result.Error = resp.Status
+		}
+		return result, resp.StatusCode, errors.New(result.Error)
+	}
+	return result, resp.StatusCode, nil
+}
+
+func (s *server) callAdminMultipart(ctx context.Context, apiPath string, metadata any, fileName string, data []byte) (admin.CommandResult, error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	meta, err := json.Marshal(metadata)
+	if err != nil {
+		return admin.CommandResult{}, err
+	}
+	if err := writer.WriteField("metadata", string(meta)); err != nil {
+		return admin.CommandResult{}, err
+	}
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return admin.CommandResult{}, err
+	}
+	if _, err := part.Write(data); err != nil {
+		return admin.CommandResult{}, err
+	}
+	if err := writer.Close(); err != nil {
+		return admin.CommandResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.AdminAPIURL+apiPath, &body)
+	if err != nil {
+		return admin.CommandResult{}, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+s.cfg.AdminAPIToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return admin.CommandResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var result admin.CommandResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return result, fmt.Errorf("admin api %s: status=%d body=%s", apiPath, resp.StatusCode, string(raw))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if result.Error == "" {
+			result.Error = resp.Status
+		}
+		return result, errors.New(result.Error)
+	}
+	return result, nil
+}
+
+func decodeAction(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if err := decodeJSON(r, dst); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	return true
+}
+
+func decodeJSON(r *http.Request, dst any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeCommandResultAPI(w http.ResponseWriter, result admin.CommandResult, err error) {
+	if err != nil {
+		if result.Status == "" {
+			result.Status = "failed"
+		}
+		if result.Message == "" {
+			result.Message = "command failed"
+		}
+		if result.Error == "" {
+			result.Error = err.Error()
+		}
+		writeJSON(w, http.StatusBadGateway, result)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func writeAPIError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{"error": message})
+}
+
+// Every admin API response goes through this -- an operator console
+// showing live server state (process status, boot_id, ...) has nothing
+// that should ever be served from a cache, browser or otherwise. Without
+// this, GET /api/session specifically -- polled by the Restart/Update
+// overlay to notice a new process's boot_id came up -- could have a
+// cached response served back to it and sit reporting the *old* boot_id
+// forever, reporting "Still restarting..." long after the new process
+// was already up and answering.
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func parseInt64(v string) (int64, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(v, 10, 64)
+}
+
+func parseInt(v string) (int, error) {
+	n, err := parseInt64(v)
+	return int(n), err
+}
+
+func boolValue(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
+}
+
+func displayPhone(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.HasPrefix(v, "+") {
+		return v
+	}
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return v
+		}
+	}
+	return "+" + v
+}
+
+func channelKind(ch ChannelRow) string {
+	if ch.Broadcast && !ch.Megagroup {
+		return "频道"
+	}
+	if ch.Megagroup {
+		if ch.Forum {
+			return "超级群/论坛"
+		}
+		return "超级群"
+	}
+	return "频道/群"
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
