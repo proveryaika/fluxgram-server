@@ -1,0 +1,430 @@
+package main
+
+import (
+	"context"
+	"crypto/subtle"
+	"errors"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// Panel session authorisation and CSRF.
+//
+// The panel authenticates with a cookie, which is what makes it a CSRF target:
+// a request forged by any other origin arrives with the operator's session
+// attached. Two independent checks close that.
+//
+// 1. Double-submit token. At login the server mints a random token, publishes it
+//    in a readable cookie (telesrv_admin_csrf) and requires the same value in the
+//    X-CSRF-Token header of every mutating request. A cross-origin page can make
+//    the browser *send* the cookie but cannot read it, so it cannot produce the
+//    header. Double-submit is the right shape here specifically because this
+//    process keeps no server-side session store: the session lives entirely in a
+//    signed cookie, so there is nowhere to park a per-session token, and the
+//    stateless variant is the one that survives a restart and a second replica.
+//    The token is additionally bound into the signed session claims, so a
+//    cookie-writing neighbour (a sibling subdomain) cannot supply a matching
+//    cookie/header pair of its own choosing either.
+//
+// 2. Origin agreement. When the browser states an Origin, it must be this host.
+//    That catches a forged request from a page that somehow does hold a token.
+//
+// Both comparisons are constant time, for the same reason the session MAC is.
+
+// Panel permission names. They match the strings an operator configures in
+// TELESRV_ADMIN_UI_PERMISSIONS and the ones the admin API enforces.
+const (
+	permissionAll                = "*"
+	permissionPremiumManage      = "premium.manage"
+	// permissionDonationsManage gates the crypto donations admin page:
+	// wallet status, chain config (RPC/WS endpoint, enabled flag,
+	// confirmation depth, pricing) and the deposit/transaction history.
+	// Never exposes the wallet mnemonic or a private key -- there is no
+	// admin route that returns either.
+	permissionDonationsManage = "donations.manage"
+	permissionBotTokenRead       = "bots.token.read"
+	permissionVerificationReview = "verification.review"
+	permissionVerificationRevoke = "verification.revoke"
+	// Third-party bot verification. Deliberately not implied by the official
+	// verification rights above: the two are separate mechanisms over separate
+	// tables, so a session trusted with one queue is not thereby trusted with the
+	// other. review reads and decides applications; manage appoints verifiers,
+	// curates the icon catalogue and strips granted marks.
+	permissionBotVerificationReview = "botverification.review"
+	permissionBotVerificationManage = "botverification.manage"
+	// permissionServerManage gates the whole Server Settings panel: identity
+	// (name/description/icon), .env editing, and Restart/Update -- all of it
+	// meaningfully more sensitive than any domain-data action above (.env
+	// editing exposes every secret the deployment holds; Restart/Update runs
+	// git/go and bounces the live MTProto process), so it is one right, not
+	// split into review/manage like the sections above.
+	permissionServerManage = "server.manage"
+	// permissionAdminsManage gates the operator accounts themselves: creating
+	// them, editing their rights, disabling them, resetting their passwords.
+	//
+	// It is the one right that can grant every other right, so it is never
+	// implied by anything else and is worth handing out to far fewer people
+	// than server.manage. guardManagerRemoval additionally refuses the edit
+	// that would leave nobody holding it.
+	permissionAdminsManage = "admins.manage"
+
+	// Section rights, in read/manage pairs that follow the sidebar. Reading a
+	// section and changing it are separate grants because most of the people
+	// who need to look at this data never need to alter it.
+	permissionAccountsRead     = "accounts.read"
+	permissionAccountsManage   = "accounts.manage"
+	permissionChannelsRead     = "channels.read"
+	permissionChannelsManage   = "channels.manage"
+	permissionBotsRead         = "bots.read"
+	permissionBotsManage       = "bots.manage"
+	permissionMessagesRead     = "messages.read"
+	permissionMessagesManage   = "messages.manage"
+	permissionModerationReview = "moderation.review"
+	permissionBroadcastsRead   = "broadcasts.read"
+	permissionBroadcastsSend   = "broadcasts.send"
+	permissionStorageRead      = "storage.read"
+	permissionStorageManage    = "storage.manage"
+	// Sticker packs, emoji packs and the GIF catalogue: one section as far as
+	// the panel is concerned, so one pair of rights.
+	permissionContentRead     = "content.read"
+	permissionContentManage   = "content.manage"
+	permissionUsernamesRead   = "usernames.read"
+	permissionUsernamesManage = "usernames.manage"
+	permissionDashboardRead   = "dashboard.read"
+	// permissionAuditRead gates the global action trail: every admin_commands
+	// row across every target, not just the ones shown on one account/channel/
+	// bot's own detail page. Separate from those existing per-target views
+	// (which any read right for that section already exposes) because seeing
+	// everyone else's actions in one place is a meaningfully bigger grant.
+	permissionAuditRead = "audit.read"
+	// Composite account rating (see internal/app/rating). read pages the
+	// leaderboard and detail; manage recomputes and adjusts.
+	permissionRatingsRead   = "ratings.read"
+	permissionRatingsManage = "ratings.manage"
+	// StarGift catalog authoring (plain gifts only -- see
+	// internal/admin.StarGiftCatalogService's doc comment for what "manage"
+	// deliberately does not cover yet).
+	permissionStarGiftsRead   = "stargifts.read"
+	permissionStarGiftsManage = "stargifts.manage"
+
+	// permissionSessionOnly marks the handful of routes that need a session but
+	// no right: reading who you are, and signing out. It is not a grantable
+	// name -- scopedRoute treats it as "authenticated is enough" -- so it can
+	// never be typed into an account's permission list by mistake.
+	permissionSessionOnly = ""
+)
+
+// assignablePermissions is the vocabulary the operator-accounts screen offers.
+//
+// The wildcard is deliberately absent: it is meaningful in
+// TELESRV_ADMIN_UI_PERMISSIONS for the break-glass login, but handing "*" to a
+// named account through a UI is how least privilege quietly stops being a
+// thing. An operator who genuinely needs everything gets every entry ticked,
+// which at least leaves a legible record of what was granted.
+func assignablePermissions() []string {
+	return []string{
+		permissionAccountsRead,
+		permissionAccountsManage,
+		permissionChannelsRead,
+		permissionChannelsManage,
+		permissionBotsRead,
+		permissionBotsManage,
+		permissionMessagesRead,
+		permissionMessagesManage,
+		permissionModerationReview,
+		permissionBroadcastsRead,
+		permissionBroadcastsSend,
+		permissionContentRead,
+		permissionContentManage,
+		permissionUsernamesRead,
+		permissionUsernamesManage,
+		permissionStorageRead,
+		permissionStorageManage,
+		permissionDashboardRead,
+		permissionPremiumManage,
+		permissionDonationsManage,
+		permissionBotTokenRead,
+		permissionVerificationReview,
+		permissionVerificationRevoke,
+		permissionBotVerificationReview,
+		permissionBotVerificationManage,
+		permissionServerManage,
+		permissionAdminsManage,
+		permissionAuditRead,
+		permissionRatingsRead,
+		permissionRatingsManage,
+		permissionStarGiftsRead,
+		permissionStarGiftsManage,
+	}
+}
+
+// scopedRoute is the only way an API route should be registered. Requiring the
+// permission as an argument is what makes the panel deny-by-default: a route
+// cannot be added without someone stating which right it belongs to, so the
+// failure mode of forgetting is a compile error rather than an endpoint that
+// quietly answers to everyone.
+//
+// permissionSessionOnly is the deliberate exception, spelled out at each use.
+func (s *server) scopedRoute(permission string, handler http.Handler) http.Handler {
+	if permission == permissionSessionOnly {
+		return s.requireAuthAPI(handler)
+	}
+	return s.requireAuthAPI(s.requirePermission(permission, handler))
+}
+
+// scopedRouteAll is scopedRoute for a route that needs more than one right at
+// once -- taking a granted verification badge away needs both the right to work
+// the queue and the separate right to revoke. Every permission must be held;
+// they are requirements, not alternatives.
+func (s *server) scopedRouteAll(permissions []string, handler http.Handler) http.Handler {
+	if len(permissions) == 0 {
+		// Refusing outright beats silently degrading to "any session": an empty
+		// list here is a mistake at the call site, not a way to open a route.
+		panic("scopedRouteAll: no permissions given")
+	}
+	wrapped := handler
+	for i := len(permissions) - 1; i >= 0; i-- {
+		wrapped = s.requirePermission(permissions[i], wrapped)
+	}
+	return s.requireAuthAPI(wrapped)
+}
+
+type permissionsKey struct{}
+
+// requireAuthAPI is the gate on every authenticated API route: a valid session,
+// and -- for a mutating request -- a valid CSRF token.
+func (s *server) requireAuthAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie(sessionCookieName)
+		if err != nil {
+			writeAPIError(w, http.StatusUnauthorized, "not authenticated")
+			return
+		}
+		claims, ok := verifySession(s.cfg.SessionKey, cookie.Value, time.Now())
+		if !ok {
+			clearSessionCookie(w)
+			writeAPIError(w, http.StatusUnauthorized, "not authenticated")
+			return
+		}
+		if !checkMutationSafety(w, r, claims) {
+			return
+		}
+		// Rights inside the cookie are a 12-hour snapshot; the account they
+		// belong to may have been disabled, demoted or had its password changed
+		// since. Re-read it and use what the database says now, so revocation
+		// takes effect on the next request rather than at session expiry.
+		permissions, ok, revoked := s.currentSessionPermissions(r.Context(), claims)
+		if !ok {
+			// Only a *confirmed* revocation (the account was disabled,
+			// deleted, or its epoch moved) clears the cookie -- a bare
+			// query failure (Postgres pool still warming up right after
+			// this very process restarted, a transient network blip)
+			// does not, or the operator's very next request -- the one
+			// made once whatever was transient has passed -- would find
+			// itself logged out for no reason it could ever recover
+			// from on its own. This is exactly the window the
+			// Restart/Update overlay polls through: clearing the cookie
+			// here turned one slow request into a permanent 401 storm
+			// until the operator logged back in by hand.
+			if revoked {
+				clearSessionCookie(w)
+			}
+			writeAPIError(w, http.StatusUnauthorized, "session is no longer valid")
+			return
+		}
+		ctx := context.WithValue(r.Context(), actorKey{}, claims.Actor)
+		ctx = context.WithValue(ctx, claimsKey{}, claims)
+		ctx = context.WithValue(ctx, permissionsKey{}, permissions)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// currentSessionPermissions resolves the rights this request actually gets.
+//
+// The break-glass operator (UserID 0) has no database row and keeps the
+// configured set -- that login exists precisely for when the database cannot
+// be consulted, so it must not depend on one.
+//
+// A named account is re-read every request. Anything that moved its token
+// epoch invalidates the session; anything that narrowed its permissions
+// narrows this request. A read failure is treated as a refusal rather than as
+// permission, so a database outage cannot silently widen access -- but it is
+// deliberately NOT treated the same as a confirmed revocation: ok=false
+// refuses this one request either way, while revoked=true is reserved for
+// "the database was reachable and said this account is disabled/deleted or
+// its epoch moved", the only case worth requireAuthAPI actually clearing the
+// session cookie over. Conflating the two used to mean a single transient
+// query failure -- most likely right after an admin-panel restart, exactly
+// when the Restart/Update overlay is polling and the fresh connection pool
+// may still be warming up -- logged the operator out for good, with no
+// retry able to recover a cookie that was already gone.
+func (s *server) currentSessionPermissions(ctx context.Context, claims sessionClaims) (perms panelPermissions, ok bool, revoked bool) {
+	if claims.UserID == 0 {
+		return newPanelPermissions(claims.Permissions), true, false
+	}
+	if s.read == nil {
+		return panelPermissions{}, false, false
+	}
+	enabled, epoch, permissions, err := s.read.AdminConsoleSessionState(ctx, claims.UserID)
+	ok, revoked = classifySessionState(enabled, epoch, claims.Epoch, err)
+	if !ok {
+		return panelPermissions{}, false, revoked
+	}
+	return newPanelPermissions(permissions), true, false
+}
+
+// classifySessionState turns the result of re-reading a named account's row
+// (or the error trying to) into (ok, revoked). ok=false always refuses the
+// request, same fail-closed behavior as before; revoked is the narrower
+// signal, true only when the database was actually reachable and confirmed
+// the account is disabled/deleted or its epoch moved -- the one case worth
+// requireAuthAPI clearing the session cookie over. A pure function so the
+// distinction (see currentSessionPermissions' doc comment for why it
+// matters) is directly testable without a real database.
+func classifySessionState(enabled bool, epoch, claimEpoch int32, err error) (ok, revoked bool) {
+	if err != nil {
+		return false, errors.Is(err, errAdminUserNotFound)
+	}
+	if !enabled || epoch != claimEpoch {
+		return false, true
+	}
+	return true, false
+}
+
+// requirePermission refuses a session that was not granted the right, before the
+// request ever reaches the admin API. The panel is the only caller that can be
+// driven by a browser, so the check belongs here as well as upstream: a 403 from
+// this process costs no round trip and cannot be confused with a domain failure.
+func (s *server) requirePermission(permission string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !permissionsFromContext(r.Context()).Has(permission) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error":      "permission " + permission + " is required",
+				"code":       "FORBIDDEN",
+				"permission": permission,
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// checkMutationSafety enforces the CSRF contract on a mutating request.
+func checkMutationSafety(w http.ResponseWriter, r *http.Request, claims sessionClaims) bool {
+	if !mutatingMethod(r.Method) {
+		return true
+	}
+	if !sameOriginRequest(r) {
+		writeAPIError(w, http.StatusForbidden, "origin is not allowed")
+		return false
+	}
+	cookie, err := r.Cookie(csrfCookieName)
+	if err != nil || cookie.Value == "" {
+		writeAPIError(w, http.StatusForbidden, "missing "+csrfCookieName+" cookie; sign in again")
+		return false
+	}
+	header := strings.TrimSpace(r.Header.Get(csrfHeaderName))
+	if header == "" {
+		writeAPIError(w, http.StatusForbidden, "missing "+csrfHeaderName+" header")
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(header), []byte(cookie.Value)) != 1 {
+		writeAPIError(w, http.StatusForbidden, csrfHeaderName+" does not match the "+csrfCookieName+" cookie")
+		return false
+	}
+	// The signed session is the third leg: it pins the pair to the session this
+	// server issued. A session minted before the token existed carries no CSRF
+	// claim and is refused, which forces one re-login rather than leaving a
+	// half-protected session running.
+	if claims.CSRF == "" || subtle.ConstantTimeCompare([]byte(header), []byte(claims.CSRF)) != 1 {
+		writeAPIError(w, http.StatusForbidden, "csrf token is not bound to this session; sign in again")
+		return false
+	}
+	return true
+}
+
+// mutatingMethod reports whether the method changes state. GET/HEAD/OPTIONS are
+// the safe ones; everything else has to carry a token.
+func mutatingMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+// sameOriginRequest checks the Origin header against the request host.
+//
+// An absent Origin is accepted: browsers omit it on same-origin requests and
+// non-browser callers (curl, tests) never send it, so requiring it would break
+// the panel without adding protection the token does not already give. A present
+// Origin must be this host -- including the literal "null" a sandboxed or
+// privacy-stripped context sends, which is by definition not this host.
+//
+// This compares against r.Host, so a reverse proxy in front of the panel has to
+// preserve it (nginx: proxy_set_header Host $host).
+func sameOriginRequest(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+// panelPermissions is a resolved session permission set.
+type panelPermissions struct {
+	all   bool
+	names map[string]struct{}
+	list  []string
+}
+
+func newPanelPermissions(permissions []string) panelPermissions {
+	set := panelPermissions{names: make(map[string]struct{}, len(permissions))}
+	for _, permission := range permissions {
+		permission = strings.TrimSpace(permission)
+		if permission == "" {
+			continue
+		}
+		if _, dup := set.names[permission]; dup {
+			continue
+		}
+		if permission == permissionAll {
+			set.all = true
+		}
+		set.names[permission] = struct{}{}
+		set.list = append(set.list, permission)
+	}
+	return set
+}
+
+// Has reports whether the session was granted the permission.
+func (p panelPermissions) Has(permission string) bool {
+	if p.all {
+		return true
+	}
+	_, ok := p.names[permission]
+	return ok
+}
+
+// List is what the panel is told about itself, so the UI can hide a section the
+// session may not use instead of rendering it into a 403.
+func (p panelPermissions) List() []string {
+	if p.list == nil {
+		return []string{}
+	}
+	return p.list
+}
+
+func permissionsFromContext(ctx context.Context) panelPermissions {
+	if permissions, ok := ctx.Value(permissionsKey{}).(panelPermissions); ok {
+		return permissions
+	}
+	return panelPermissions{}
+}
