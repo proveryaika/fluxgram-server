@@ -1,0 +1,500 @@
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 400; font-display: swap; src: url("/fonts/plus-jakarta-sans-400.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 500; font-display: swap; src: url("/fonts/plus-jakarta-sans-500.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 600; font-display: swap; src: url("/fonts/plus-jakarta-sans-600.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 700; font-display: swap; src: url("/fonts/plus-jakarta-sans-700.woff2") format("woff2"); }
+@font-face { font-family: "Plus Jakarta Sans"; font-style: normal; font-weight: 800; font-display: swap; src: url("/fonts/plus-jakarta-sans-800.woff2") format("woff2"); }
+
+:root {
+  /* One dark theme; there is no light variant and no switch. */
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg: #08080e;
+  --bg-accent: #0e0e14;
+  --panel: #12121a;
+  --panel-subtle: #181822;
+  --panel-strong: #1e1e28;
+  /* Loading placeholders. Kept as their own pair rather than reusing the
+     panel shades because the sheen has to read as lighter than the base,
+     which the panel ramp does not. */
+  --skeleton-base: #1e1e28;
+  --skeleton-sheen: #2a2a34;
+  --surface-soft: #15151e;
+  --overlay: rgba(0, 0, 0, 0.66);
+  --topbar-bg: rgba(14, 14, 20, 0.86);
+
+  /* Lines */
+  --line: #222228;
+  --line-strong: #2e2e36;
+
+  /* Text */
+  --heading: #eef3f8;
+  --text: #d5dde6;
+  --text-soft: #c2ccd6;
+  --muted: #98a4b1;
+  --muted-2: #6d7885;
+
+  /* Brand */
+  --brand: #5b9dff;
+  --brand-strong: #7db4ff;
+  --brand-2: #7cd1fb;
+  --grad: linear-gradient(135deg, #38bdf8 0%, #2563eb 55%, #1e40af 100%);
+  --brand-tint: #142a4a;
+  --brand-tint-border: #24466e;
+  --brand-tint-text: #9dc3f5;
+
+  /* Semantic */
+  --good: #47c281;
+  --good-tint: #12301f;
+  --good-border: #245639;
+  --warn: #e0aa4d;
+  --warn-tint: #322810;
+  --warn-border: #574413;
+  --danger: #e6695c;
+  --danger-tint: #35201d;
+  --danger-border: #5c332d;
+  --danger-text: #f0a49b;
+
+  /* Accent (collectibles / craft) */
+  --purple: #ac90e2;
+  --purple-tint: #221b31;
+  --purple-border: #3d3357;
+  --purple-text: #c9b6ef;
+
+  /* Inputs & controls */
+  --input-bg: #0e0e14;
+  --btn-bg: #181822;
+  --btn-text: #dbe2ea;
+  --btn-hover: #22222c;
+  --switch-track: #34343e;
+
+  /* Code / JSON blocks */
+  --code-bg: #0b0b11;
+  --code-text: #cdd9e5;
+  --code-border: #222228;
+
+  /* Sidebar */
+  --sidebar: #0c0c14;
+  --sidebar-soft: #181822;
+  --sidebar-line: #222228;
+  --sidebar-row: #12121a;
+  --sidebar-text: #cbd4de;
+  --sidebar-muted: #7c8794;
+  --sidebar-faint: #6f7b88;
+  --sidebar-heading: #f0f4f8;
+
+  /* Effects */
+  --focus: rgba(91, 157, 255, 0.24);
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.46);
+  --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.38);
+  --shadow-brand: 0 8px 22px rgba(91, 157, 255, 0.26);
+  --hero-glow: rgba(91, 157, 255, 0.25);
+  --hero-grid: rgba(255, 255, 255, 0.04);
+
+  /* Radii */
+  --radius-xs: 8px;
+  --radius-sm: 9px;
+  --radius: 11px;
+  --radius-lg: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  background: var(--bg);
+  font: 13px/1.45 "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.shell {
+  display: grid;
+  min-height: 100vh;
+  grid-template-columns: 232px minmax(0, 1fr);
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  display: flex;
+  height: 100vh;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+  padding: 18px 12px;
+  color: var(--sidebar-text);
+  background: var(--sidebar);
+  border-right: 1px solid var(--sidebar-line);
+  /* Firefox: thin, muted, matches the dark sidebar instead of the OS default. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--sidebar-line) transparent;
+}
+
+.sidebar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.sidebar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+  background: var(--sidebar-line);
+  border-radius: 999px;
+}
+
+.sidebar::-webkit-scrollbar-thumb:hover {
+  background: var(--sidebar-muted);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 0 4px;
+}
+
+.brand.compact {
+  justify-content: center;
+}
+
+.brand-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  overflow: hidden;
+  place-items: center;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.brand strong {
+  display: block;
+  font-size: 14px;
+  line-height: 1.1;
+}
+
+.brand small {
+  display: block;
+  margin-top: 3px;
+  color: var(--sidebar-muted);
+  font-size: 11px;
+}
+
+.sidebar-server-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.sidebar-server-action {
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--sidebar-text);
+  background: transparent;
+  border-color: var(--sidebar-line);
+}
+
+.sidebar-server-action:hover:not(:disabled) {
+  background: var(--sidebar-line);
+}
+
+.sidebar-server-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sidebar-server-action-error {
+  padding: 0 4px;
+  color: var(--danger, #e5484d);
+  font-size: 11.5px;
+}
+
+.sidebar-label {
+  padding: 0 8px;
+  color: var(--sidebar-faint);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.sidebar-api-layer,
+.sidebar-build {
+  font-weight: 500;
+  text-transform: none;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  opacity: 0.7;
+}
+
+.sidebar-update {
+  color: var(--accent, #4aa3ff);
+  text-decoration: none;
+  text-transform: none;
+}
+
+.sidebar-update:hover {
+  text-decoration: underline;
+}
+
+.nav-list {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-section {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-section-toggle {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 16px;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  color: var(--sidebar-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  text-align: left;
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
+}
+
+.nav-section-toggle:hover,
+.nav-section.active .nav-section-toggle {
+  color: var(--sidebar-heading);
+  background: var(--sidebar-soft);
+  border-color: #34404d;
+}
+
+.nav-section-chevron {
+  justify-self: end;
+  color: var(--sidebar-muted);
+  transition: transform 140ms ease;
+}
+
+.nav-section.open .nav-section-chevron {
+  transform: rotate(180deg);
+}
+
+.nav-children {
+  display: grid;
+  gap: 4px;
+  padding: 2px 0 2px 18px;
+}
+
+.nav-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  min-height: 38px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  color: var(--sidebar-text);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
+}
+
+.nav-dot {
+  width: 6px;
+  height: 6px;
+  justify-self: center;
+  background: var(--sidebar-faint);
+  border-radius: 999px;
+}
+
+.nav-item:hover,
+.nav-item.active {
+  color: var(--sidebar-heading);
+  background: var(--sidebar-soft);
+  border-color: #34404d;
+}
+
+.nav-item.active .nav-dot {
+  background: var(--brand);
+}
+
+.sidebar-status {
+  display: grid;
+  gap: 7px;
+  margin-top: auto;
+}
+
+.runtime-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  color: var(--sidebar-text);
+  background: var(--sidebar-row);
+  border: 1px solid #27313c;
+  border-radius: var(--radius-sm);
+}
+
+.runtime-row strong {
+  color: var(--sidebar-heading);
+  font-size: 11px;
+}
+
+.workspace {
+  min-width: 0;
+}
+
+.topbar {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  display: flex;
+  min-height: 66px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 12px 24px;
+  background: var(--topbar-bg);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(12px);
+}
+
+.topbar h1 {
+  margin: 2px 0 0;
+  color: var(--heading);
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.topbar-actions,
+.page-actions,
+.section-action,
+.entity-badges,
+.row-actions,
+.modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.actor-pill {
+  display: inline-flex;
+  min-height: 30px;
+  /* Icon and name read as one label rather than two adjacent things. */
+  gap: 6px;
+  align-items: center;
+  padding: 0 12px;
+  font-weight: 600;
+  color: var(--text-soft);
+  background: var(--panel-subtle);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.content {
+  display: grid;
+  gap: 16px;
+  padding: 18px 24px 30px;
+}
+
+.eyebrow {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Collapsible navigation.
+   Scoped to the width where the sidebar is actually a sidebar: below 1120px the
+   shell already stacks it into a horizontal strip (05-responsive.css), and
+   collapsing that would just hide the labels of a bar that has room for them. */
+@media (min-width: 1121px) {
+  .shell--nav-collapsed {
+    grid-template-columns: 68px minmax(0, 1fr);
+  }
+
+  /* Everything that only makes sense with room for words goes away: the
+     wordmark beside the logo, the "Navigation" heading, the version block and
+     the Connect/Share buttons. The icons and their tooltips remain. */
+  .shell--nav-collapsed .brand > span:not(.brand-mark),
+  .shell--nav-collapsed .sidebar-label,
+  .shell--nav-collapsed .sidebar-status,
+  .shell--nav-collapsed .sidebar-server-actions,
+  .shell--nav-collapsed .nav-item-label {
+    display: none;
+  }
+
+  .shell--nav-collapsed .sidebar {
+    padding: 18px 10px;
+    align-items: center;
+  }
+
+  .shell--nav-collapsed .brand {
+    justify-content: center;
+    padding: 0;
+  }
+
+  /* One column instead of icon + label, so the glyph sits centred in the rail
+     rather than clinging to the left edge where the text used to start. */
+  .shell--nav-collapsed .nav-item {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    padding: 0;
+    width: 44px;
+  }
+
+  .shell--nav-collapsed .nav-list {
+    justify-items: center;
+  }
+}
+
+/* The toggle sits with the page title rather than inside the sidebar: it has to
+   stay reachable at 68px wide, and a control that hides with the thing it
+   controls is a trap. */
+.topbar-lead {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.nav-toggle {
+  flex: 0 0 auto;
+}
