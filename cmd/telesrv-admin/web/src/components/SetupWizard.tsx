@@ -1,0 +1,535 @@
+import { ArrowRight, Check, ImagePlus, Loader2, Rocket, UserPlus } from "./icons";
+import type { ReactNode } from "react";
+import { useEffect, useState } from "react";
+import { api, errorMessage } from "../api";
+import { RestartOverlay, ServerIconModal, useAdminRestartWatcher } from "../pages/ServerSettingsPage";
+import { AppBackground } from "./AppBackground";
+import { Alert } from "./ui";
+import { StorageStep } from "./StorageStep";
+
+// The first-run wizard: shown instead of the normal shell exactly once, when
+// GET /api/session answers setup_completed=false (see
+// identity.Store.SetupPending and cmd/telesrv-admin/server.go's
+// handleSession). It covers the same ground
+// tui-panel/server-panel.py's SetupWizardScreen used to ask for in the
+// terminal before the server could even start -- server identity, the public
+// network fields a real deployment needs, and a named operator account to
+// replace the generated break-glass password -- except every field here
+// already has a working default (see quickstart's bootstrap_env), so nothing
+// blocks Start anymore. This just walks through customizing it.
+//
+// Every step's "Continue" calls the same /api/actions/* route the equivalent
+// Server Settings / Operators screen uses, with a fixed reason instead of an
+// operator-typed one and confirm:true immediately (no dry-run screen). The
+// rest of the panel asks an operator to justify a change to a live,
+// populated deployment; here the operator IS the only account that has ever
+// existed, configuring a server nobody else is using yet -- asking "why are
+// you naming your own server" is friction with no audit value.
+const WIZARD_REASON = "Set from the first-run setup wizard";
+
+type StepId = "welcome" | "storage" | "identity" | "network" | "botapi" | "account" | "done";
+
+const STEP_ORDER: StepId[] = ["welcome", "storage", "identity", "network", "botapi", "account", "done"];
+const STEP_LABEL: Record<StepId, string> = {
+  welcome: "Welcome",
+  storage: "Storage",
+  identity: "Identity",
+  network: "Network",
+  botapi: "Bot API",
+  account: "Account",
+  done: "Done"
+};
+
+// No prop for "leave the wizard early": this only ever shows on a genuinely
+// first-ever start, before there is a real deployment for a Skip to defer
+// anything about -- see the Welcome step. The only way out is Done's
+// "Finish setup & restart", which reloads the page once the new process
+// answers; that reload is what dismisses this component (a fresh
+// /api/session comes back with setup_completed=true).
+export function SetupWizard({ storageConfigured }: { storageConfigured: boolean }) {
+  // Saving the storage step restarts the panel and reloads the page, so the
+  // wizard picks up at the step after it.
+  const [step, setStep] = useState<StepId>(storageConfigured ? "identity" : "welcome");
+
+  function goTo(next: StepId) {
+    setStep(next);
+  }
+
+  return (
+    <main className="login-page setup-wizard-page">
+      <AppBackground />
+      <section className="login-panel setup-wizard-panel">
+        <div className="login-head">
+          <div className="brand brand-elevated">
+            <span>
+              <strong>{"Let's set up your server"}</strong>
+              <small>{"First-run setup"}</small>
+            </span>
+          </div>
+        </div>
+
+        <div className="wizard-steps">
+          {STEP_ORDER.map((id, index) => {
+            const currentIndex = STEP_ORDER.indexOf(step);
+            const state = index === currentIndex ? "active" : index < currentIndex ? "done" : "";
+            return (
+              <div key={id} className={`command-step ${state}`}>
+                <span>{index < currentIndex ? <Check size={12} /> : index + 1}</span>
+                <strong>{STEP_LABEL[id]}</strong>
+              </div>
+            );
+          })}
+        </div>
+
+        {step === "welcome" && <WelcomeStep onNext={() => goTo("storage")} />}
+        {step === "storage" && <StorageStep />}
+        {step === "identity" && <IdentityStep onNext={() => goTo("network")} />}
+        {step === "network" && <NetworkStep onNext={() => goTo("botapi")} />}
+        {step === "botapi" && <BotApiStep onNext={() => goTo("account")} />}
+        {step === "account" && <AccountStep onNext={() => goTo("done")} />}
+        {step === "done" && <DoneStep />}
+      </section>
+    </main>
+  );
+}
+
+function WizardActions({ children }: { children: ReactNode }) {
+  return <div className="wizard-actions">{children}</div>;
+}
+
+function WelcomeStep({ onNext }: { onNext: () => void }) {
+  return (
+    <div className="wizard-step-body">
+      <p className="wizard-welcome-greeting">{"Hi!"}</p>
+      <p>
+        {"Let's get your server set up -- where it keeps its data, a name, an address for clients, and an account of "}
+        {"your own. Takes about a minute, and everything here stays editable later."}
+      </p>
+      <WizardActions>
+        <button className="btn primary icon-text" type="button" onClick={onNext}>
+          {"Get started"} <ArrowRight size={15} />
+        </button>
+      </WizardActions>
+    </div>
+  );
+}
+
+function IdentityStep({ onNext }: { onNext: () => void }) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [iconExt, setIconExt] = useState<string | undefined>(undefined);
+  const [iconModalOpen, setIconModalOpen] = useState(false);
+  const [iconBust, setIconBust] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api.serverIdentity()
+      .then((info) => {
+        if (cancelled) return;
+        setName(info.name);
+        setDescription(info.description);
+        setIconExt(info.icon_ext);
+        setLoaded(true);
+      })
+      .catch((err) => { if (!cancelled) { setError(errorMessage(err)); setLoaded(true); } });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.action("/api/actions/set-server-identity", {
+        command_id: "", reason: WIZARD_REASON, confirm: true, name, description
+      });
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      onNext();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="wizard-step-body">
+      <p className="wizard-step-hint">{"Shown to clients when they add this server, and in the sidebar here."}</p>
+      {error && <Alert>{error}</Alert>}
+      <div className="wizard-identity-row">
+        <div className="avatar-edit-slot">
+          {iconExt ? (
+            <img className="avatar-photo-img" src={api.serverIconURL() + `&b=${iconBust}`} alt="" style={{ width: 72, height: 72 }} />
+          ) : (
+            <div className="avatar-fallback server-icon-fallback" style={{ width: 72, height: 72 }}>
+              <ImagePlus size={22} />
+            </div>
+          )}
+          <button className="icon-btn avatar-edit-btn" type="button" aria-label={"Add server icon"} onClick={() => setIconModalOpen(true)}>
+            <ImagePlus size={13} />
+          </button>
+        </div>
+        <div className="server-identity-fields">
+          <label className="form-field"><span>{"Name"}</span><input value={name} maxLength={128} placeholder={"FluxGram"} disabled={!loaded} onChange={(event) => setName(event.target.value)} /></label>
+          <label className="form-field"><span>{"Description"}</span><textarea rows={2} value={description} maxLength={512} disabled={!loaded} onChange={(event) => setDescription(event.target.value)} /></label>
+        </div>
+      </div>
+      <WizardActions>
+        <button className="btn primary icon-text" type="button" disabled={busy || !loaded} onClick={() => void submit()}>
+          {busy ? <Loader2 className="spin" size={15} /> : <ArrowRight size={15} />}
+          {"Continue"}
+        </button>
+      </WizardActions>
+      {iconModalOpen && (
+        <ServerIconModal
+          hasIcon={!!iconExt}
+          autoReason={WIZARD_REASON}
+          onClose={() => setIconModalOpen(false)}
+          onDone={() => { setIconBust((n) => n + 1); void api.serverIdentity().then((info) => setIconExt(info.icon_ext)); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// The public base URL (invite/sticker-pack links) is just the advertise
+// IP wrapped in "http://<ip>:2401" for the overwhelming majority of
+// installs -- :2401 matches the Public Web Listener's default port (see
+// .env.example). Deriving it means the operator types their IP exactly
+// once; "Use a different public URL" below is the escape hatch for anyone
+// who actually has a domain + HTTPS in front of it.
+function defaultPublicBaseURL(ip: string): string {
+  const trimmed = ip.trim();
+  return trimmed ? `http://${trimmed}:2401` : "";
+}
+
+const ADVERTISE_IP_KEY = "TELESRV_ADVERTISE_IP";
+const PUBLIC_BASE_URL_KEY = "TELESRV_PUBLIC_BASE_URL";
+
+// TELESRV_PUBLIC_APP_SCHEME (the custom "owpg://"-style deep-link scheme)
+// used to be a wizard field, but it's not something a fresh install has an
+// opinion on -- it only matters once you've compiled your own client
+// builds with a non-default scheme, at which point you're already editing
+// .env by hand or through Server Settings anyway. Leaving it out here
+// means the default (already correct for the official clients) just works.
+function NetworkStep({ onNext }: { onNext: () => void }) {
+  const [ip, setIp] = useState("");
+  const [customBaseURL, setCustomBaseURL] = useState(false);
+  const [baseURL, setBaseURL] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api.serverEnv()
+      .then((groups) => {
+        if (cancelled) return;
+        let nextIp = "";
+        let nextBaseURL = "";
+        for (const group of groups) {
+          for (const field of group.fields) {
+            if (field.key === ADVERTISE_IP_KEY) nextIp = field.value;
+            if (field.key === PUBLIC_BASE_URL_KEY) nextBaseURL = field.value;
+          }
+        }
+        setIp(nextIp);
+        // Only switches the toggle on when the saved URL genuinely diverges
+        // from what this IP derives on its own -- otherwise every existing
+        // install would reopen this step looking like it already has a
+        // custom URL, when it's really just today's default.
+        if (nextBaseURL && nextBaseURL !== defaultPublicBaseURL(nextIp)) {
+          setCustomBaseURL(true);
+          setBaseURL(nextBaseURL);
+        } else {
+          setBaseURL(nextBaseURL || defaultPublicBaseURL(nextIp));
+        }
+        setLoaded(true);
+      })
+      .catch((err) => { if (!cancelled) { setError(errorMessage(err)); setLoaded(true); } });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.action("/api/actions/update-server-env", {
+        command_id: "", reason: WIZARD_REASON, confirm: true,
+        values: {
+          [ADVERTISE_IP_KEY]: ip.trim(),
+          [PUBLIC_BASE_URL_KEY]: customBaseURL ? baseURL.trim() : defaultPublicBaseURL(ip)
+        }
+      });
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      onNext();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="wizard-step-body">
+      <p className="wizard-step-hint">{"Takes effect once setup finishes below -- that last step restarts the server."}</p>
+      {error && <Alert>{error}</Alert>}
+      <label className="form-field env-field">
+        <span>{"Server public IP or hostname"}</span>
+        <span className="env-field-desc">{"What clients connect to. Fine to leave as 127.0.0.1 for local testing."}</span>
+        <input
+          value={ip}
+          placeholder={"127.0.0.1"}
+          disabled={!loaded}
+          spellCheck={false}
+          autoCapitalize="none"
+          onChange={(event) => {
+            const next = event.target.value;
+            setIp(next);
+            if (!customBaseURL) setBaseURL(defaultPublicBaseURL(next));
+          }}
+        />
+      </label>
+      <label className="checkline">
+        <input
+          type="checkbox"
+          checked={customBaseURL}
+          disabled={!loaded}
+          onChange={(event) => {
+            const next = event.target.checked;
+            setCustomBaseURL(next);
+            if (!next) setBaseURL(defaultPublicBaseURL(ip));
+          }}
+        />
+        {" Use a different public URL for invite/sticker links (custom domain, HTTPS)"}
+      </label>
+      {customBaseURL && (
+        <label className="form-field env-field">
+          <span>{"Public base URL"}</span>
+          <span className="env-field-desc">{"Used for links this server generates -- invites, sticker packs. e.g. https://example.com"}</span>
+          <input
+            value={baseURL}
+            placeholder={"http://127.0.0.1:2401"}
+            disabled={!loaded}
+            onChange={(event) => setBaseURL(event.target.value)}
+          />
+        </label>
+      )}
+      <WizardActions>
+        <button className="btn primary icon-text" type="button" disabled={busy || !loaded} onClick={() => void submit()}>
+          {busy ? <Loader2 className="spin" size={15} /> : <ArrowRight size={15} />}
+          {"Continue"}
+        </button>
+      </WizardActions>
+    </div>
+  );
+}
+
+const BOT_API_KEY = "TELESRV_BOT_API_ADDR";
+const BOT_API_PORT = "2500";
+
+// This is the address the gateway *listens* on, so it is every local
+// interface, never the advertised public IP: behind NAT (a home or office
+// router forwarding to the machine) the public IP is not on any interface,
+// the bind fails, and the server restarts in a loop.
+function defaultBotApiAddr(): string {
+  return `0.0.0.0:${BOT_API_PORT}`;
+}
+
+function BotApiStep({ onNext }: { onNext: () => void }) {
+  const [enabled, setEnabled] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api.serverEnv()
+      .then((groups) => {
+        if (cancelled) return;
+        let botApiValue = "";
+        for (const group of groups) {
+          for (const field of group.fields) {
+            if (field.key === BOT_API_KEY) botApiValue = field.value.trim();
+          }
+        }
+        setEnabled(botApiValue !== "");
+        setLoaded(true);
+      })
+      .catch((err) => { if (!cancelled) { setError(errorMessage(err)); setLoaded(true); } });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function submit() {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.action("/api/actions/update-server-env", {
+        command_id: "", reason: WIZARD_REASON, confirm: true,
+        values: { [BOT_API_KEY]: enabled ? defaultBotApiAddr() : "" }
+      });
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      onNext();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="wizard-step-body">
+      <p className="wizard-step-hint">
+        {"An HTTP gateway that lets bot libraries -- python-telegram-bot, aiogram and friends -- "}
+        {"talk to this server. Leave it off if you are not running bots; you can turn it on later in Server Settings, "}
+        {"where the listen address is also editable if the default (this server's own IP, port " + BOT_API_PORT + ") doesn't fit."}
+      </p>
+      {error && <Alert>{error}</Alert>}
+      <label className="checkline">
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={!loaded}
+          onChange={(event) => setEnabled(event.target.checked)}
+        />
+        {" Enable the Bot API gateway"}
+      </label>
+      <WizardActions>
+        <button className="btn primary icon-text" type="button" disabled={busy || !loaded} onClick={() => void submit()}>
+          {busy ? <Loader2 className="spin" size={15} /> : <ArrowRight size={15} />}
+          {"Continue"}
+        </button>
+      </WizardActions>
+    </div>
+  );
+}
+
+function AccountStep({ onNext }: { onNext: () => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const incomplete = username.trim().length < 3 || password.trim() === "";
+
+  async function submit() {
+    if (incomplete) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.action("/api/actions/create-admin-operator", {
+        command_id: "", reason: WIZARD_REASON, confirm: true,
+        username: username.trim(), password, permissions: ["*"], enabled: true
+      });
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      onNext();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="wizard-step-body">
+      <p className="wizard-step-hint">{"Replace the generated password with a login of your own."}</p>
+      {error && <Alert>{error}</Alert>}
+      <label className="form-field"><span>{"Username"}</span><input autoFocus value={username} spellCheck={false} autoCapitalize="none" placeholder={"letters, digits, dot, dash or underscore"} onChange={(event) => setUsername(event.target.value)} /></label>
+      <label className="form-field"><span>{"Password"}</span><input type="password" value={password} autoComplete="new-password" onChange={(event) => setPassword(event.target.value)} /></label>
+      <WizardActions>
+        <button className="btn" type="button" onClick={onNext}>{"Skip for now"}</button>
+        <button className="btn primary icon-text" type="button" disabled={busy || incomplete} onClick={() => void submit()}>
+          {busy ? <Loader2 className="spin" size={15} /> : <UserPlus size={15} />}
+          {"Create account & continue"}
+        </button>
+      </WizardActions>
+    </div>
+  );
+}
+
+// DoneStep marks setup complete and restarts, rather than leaving that for
+// later -- the network fields two steps back only take effect after a
+// restart, and asking the operator to remember to go find Restart in
+// Services afterward is exactly the kind of loose end this wizard exists to
+// close. useAdminRestartWatcher (shared with Services' own Restart button)
+// reloads the page once a genuinely new process answers; passed a
+// beforeReload that logs out first here specifically (Services' own Restart
+// button doesn't), so the reload lands back on the login form instead of
+// straight into the shell still signed in as "fluxgram" -- the whole point
+// of the Account step just before this one was to have a real login to
+// switch to instead. The generated password stops working server-side the
+// moment complete-setup runs (see identity.Store.TemporaryPasswordMatches),
+// independent of this logout; this just makes sure the browser doesn't
+// carry the old session forward and paper over that.
+function DoneStep() {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const restartWatcher = useAdminRestartWatcher();
+
+  async function finish() {
+    setBusy(true);
+    setError("");
+    try {
+      const completeResult = await api.action("/api/actions/complete-setup", { command_id: "", reason: WIZARD_REASON, confirm: true });
+      if (completeResult.error) {
+        setError(completeResult.error);
+        setBusy(false);
+        return;
+      }
+      const restartResult = await api.action("/api/actions/restart-server", { command_id: "", reason: WIZARD_REASON, confirm: true });
+      if (restartResult.error) {
+        setError(restartResult.error);
+        setBusy(false);
+        return;
+      }
+      // Longer than the Services tab's default: this restart, uniquely, runs
+      // right after a fresh install, so it can also run the one-time media
+      // seed (reactions/sticker_sets/effects/emoji_group_icons -- see
+      // internal/app/files/seed.go) before the server even reaches
+      // OnServing. On a slow connection that alone can pass five minutes,
+      // on top of the cold `go build` useAdminRestartWatcher already budgets
+      // for -- and unlike a plain Restart/Update, there's no second chance
+      // to sit and watch the wizard again once it's dismissed.
+      void restartWatcher.watch(900000, { beforeReload: async () => { await api.logout(); } });
+    } catch (err) {
+      setError(errorMessage(err));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="wizard-step-body">
+      <p>
+        {"That's the essentials. Finishing restarts the server so the network and Bot API settings from "}
+        {"the earlier steps take effect. Everything here stays editable from Server Settings and Operators any time."}
+      </p>
+      {error && <Alert>{error}</Alert>}
+      <WizardActions>
+        <button className="btn primary icon-text" type="button" disabled={busy} onClick={() => void finish()}>
+          {busy ? <Loader2 className="spin" size={15} /> : <Rocket size={15} />}
+          {"Finish setup & restart"}
+        </button>
+      </WizardActions>
+      {restartWatcher.waiting && (
+        <RestartOverlay timedOut={false} onDismiss={restartWatcher.dismiss} logLines={restartWatcher.logLines} />
+      )}
+      {restartWatcher.timedOut && (
+        <RestartOverlay timedOut={true} onDismiss={restartWatcher.dismiss} logLines={restartWatcher.logLines} />
+      )}
+    </div>
+  );
+}
