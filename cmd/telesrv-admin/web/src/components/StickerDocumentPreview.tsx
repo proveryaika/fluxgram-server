@@ -1,0 +1,84 @@
+import lottie from "lottie-web/build/player/lottie_light_canvas";
+import { useEffect, useRef, useState } from "react";
+import { api, errorMessage } from "../api";
+
+// One preview cell in a sticker/emoji set's preview grid. Mounted only while
+// its modal is open, and only for the one set being viewed — not on the list
+// page — so this never repeats the "100 animations on one page" lag.
+//
+// Documents come back as Lottie JSON (TGS-animated), a raw raster image
+// (static webp/png/etc, e.g. the "GestosLol" pack) or a WebM/MP4 video (video
+// stickers and video emoji) — branch on the response's real Content-Type
+// rather than assuming every document animates the same way.
+export function StickerDocumentPreview({ documentID, className = "", showError = true }: { documentID: string; className?: string; showError?: boolean }) {
+  const host = useRef<HTMLDivElement>(null);
+  const animation = useRef<ReturnType<typeof lottie.loadAnimation> | null>(null);
+  const [error, setError] = useState("");
+  const [imageURL, setImageURL] = useState<string | null>(null);
+  const [isVideo, setIsVideo] = useState(false);
+  // A file the browser could not draw at all (neither as an image nor as a
+  // video) shows as an empty cell, never as a broken-image glyph.
+  const [unplayable, setUnplayable] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectURL: string | null = null;
+    setError("");
+    setImageURL(null);
+    setIsVideo(false);
+    setUnplayable(false);
+
+    fetch(api.stickerDocumentAnimationURL(documentID), { credentials: "same-origin" })
+      .then(async (response) => {
+        if (!response.ok) {
+          const body = await response.json().catch(() => null);
+          throw new Error(body?.error || response.statusText);
+        }
+        const contentType = response.headers.get("content-type") ?? "";
+        if (contentType.includes("json")) {
+          const data = await response.json();
+          if (cancelled || !host.current) return;
+          animation.current?.destroy();
+          animation.current = lottie.loadAnimation({
+            container: host.current,
+            renderer: "canvas",
+            loop: true,
+            autoplay: true,
+            animationData: data
+          });
+          return;
+        }
+        const blob = await response.blob();
+        if (cancelled) return;
+        objectURL = URL.createObjectURL(blob);
+        setIsVideo(contentType.startsWith("video/"));
+        setImageURL(objectURL);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(errorMessage(err));
+      });
+
+    return () => {
+      cancelled = true;
+      animation.current?.destroy();
+      animation.current = null;
+      if (objectURL) URL.revokeObjectURL(objectURL);
+    };
+  }, [documentID]);
+
+  return (
+    <div className={`sticker-doc-cell ${className}`.trim()}>
+      {imageURL && unplayable ? null : imageURL && isVideo ? (
+        <video className="sticker-doc-image" src={imageURL} autoPlay loop muted playsInline onError={() => setUnplayable(true)} />
+      ) : imageURL ? (
+        // The server sniffs the type from the first bytes; when that guess
+        // is wrong for a sticker that is really a video, the image fails to
+        // decode -- try the same bytes as a video before giving up.
+        <img className="sticker-doc-image" src={imageURL} alt="" onError={() => setIsVideo(true)} />
+      ) : (
+        <div className="sticker-doc-canvas" ref={host} />
+      )}
+      {error && showError && <span className="sticker-doc-error">{error}</span>}
+    </div>
+  );
+}
